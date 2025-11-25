@@ -1,0 +1,11 @@
+# 업비트 API 연동 및 JWT 생성
+requests
+pyjwt
+
+# 데이터 분석 및 지표 계산
+pandas
+ta
+
+# AI (LLM) 연동
+openai
+google-generativeai
