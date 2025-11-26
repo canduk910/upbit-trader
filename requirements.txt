@@ -9,3 +9,13 @@ ta
 # AI (LLM) 연동
 openai
 google-generativeai
+
+# 환경 변수 관리를 위한 라이브러리
+python-dotenv
+
+# Web framework for runtime API
+fastapi
+uvicorn
+
+# Streamlit UI
+streamlit

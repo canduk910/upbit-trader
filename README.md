@@ -1,122 +1,145 @@
 # Upbit Spot AI Auto-Trading Bot 🤖
 
-[![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+## 프로젝트 소개
 
-본 프로젝트는 업비트(Upbit) API와 **최신 생성형 AI(OpenAI GPT-5.1, Google Gemini 2.5)**를 결합한 하이브리드 자동매매 시스템입니다.
+이 프로젝트는 업비트(Upbit) 거래소에서 자동으로 암호화폐를 사고팔 수 있는 트레이딩 봇입니다. 
+주요 목표는 다음과 같습니다:
 
-기존의 단순한 보조지표 매매 방식의 한계를 극복하기 위해, 기술적 지표로 1차 필터링을 거친 후 **두 개의 AI 모델이 합의(Ensemble)**했을 때만 매매를 진행하는 보수적이고 강력한 전략을 사용합니다.
+- **자동화된 거래**: 사람이 직접 매매하지 않아도, 설정한 전략에 따라 자동으로 거래를 실행합니다.
+- **다양한 전략 지원**: RSI, 변동성 돌파, 듀얼 모멘텀 등 여러 전략을 선택할 수 있습니다.
+- **자금 관리**: 켈리 공식(Kelly Criterion)을 사용해 자금을 효율적으로 관리합니다.
+- **사용자 친화적 설정**: JSON 파일이나 간단한 UI를 통해 설정을 쉽게 변경할 수 있습니다.
 
-> **⚠️ 중요: 투자 위험 경고**
-> 본 프로그램은 투자를 보조하는 도구일 뿐이며, 수익을 보장하지 않습니다. 투자 결정에 따른 모든 책임은 본인에게 있습니다. 실제 자금을 투입하기 전에 충분한 백테스팅과 소액 테스트를 진행하십시오.
+이 봇은 초보자도 쉽게 사용할 수 있도록 설계되었으며, 개발자라면 원하는 대로 커스터마이징할 수도 있습니다.
 
-## 🚀 주요 기능
+---
 
--   **하이브리드 전략**: 기술적 분석(RSI) + AI 판단(LLM)의 2단계 검증 시스템.
--   **AI 앙상블(Ensemble)**: **OpenAI(GPT-4o)**와 **Google(Gemini 1.5 Flash)** 두 모델에게 동시에 차트 분석을 의뢰하고, 두 AI의 의견이 일치할 때만 진입하는 '만장일치' 전략 구현.
--   **비용 효율성**: 매 틱마다 AI를 호출하지 않고, 기술적 지표(RSI)가 유효한 신호를 보낼 때만 AI에게 질문하여 API 비용을 절감합니다.
--   **시장가 매매**: 업비트의 시장가 매수/매도 기능을 사용하여 즉각적인 체결을 보장합니다.
--   **상세한 로깅**: 매매 판단의 근거, AI의 답변, 자산 변동 내역을 로그 파일로 상세히 기록합니다.
+## 주요 기능
 
-## 📂 프로젝트 구조
+- **전략 기반 거래**: 다양한 트레이딩 전략을 지원하며, 필요에 따라 새로운 전략을 추가할 수 있습니다.
+- **켈리 공식 적용**: 자금 관리 전략으로 손실을 최소화하고 수익을 극대화합니다.
+- **실시간 설정 변경**: 설정 파일(runtime/config.json)을 수정하면 봇이 자동으로 변경 사항을 반영합니다.
+- **REST API**: FastAPI를 사용해 설정을 변경하거나 봇을 제어할 수 있습니다.
+- **Streamlit UI**: 간단한 웹 인터페이스를 통해 설정을 편집하고 저장할 수 있습니다.
+
+---
+
+## 프로젝트 구조
 
 ```
-/upbit-ai-trader
-|
-├── bot.py             # (메인) 봇 실행 파일 (기술적 지표와 AI 결과 종합)
-├── upbit_api.py       # (모듈) 업비트 API 연동 및 주문 처리
-├── strategy.py        # (모듈) 1차 필터용 기술적 지표(RSI) 계산
-├── ai_analyst.py      # (모듈) OpenAI 및 Gemini API 연동, 앙상블 로직 [NEW]
-├── config.py          # (설정) API 키, 매매 전략, 앙상블 설정
-├── logger.py          # (모듈) 로그 시스템 설정
-├── requirements.txt   # (설치) 프로젝트 의존성 라이브러리
-└── README.md          # 프로젝트 설명서
+/upbit-trader
+├── server/                # 서버 코드 및 주요 로직
+│   ├── bot.py             # 트레이딩 봇의 핵심 로직
+│   ├── config.py          # 설정 파일 로드 및 저장
+│   ├── api.py             # REST API 엔드포인트
+│   ├── strategy.py        # 트레이딩 전략 구현
+│   ├── money_manager.py   # 켈리 공식 기반 자금 관리
+│   └── ... 기타 파일들
+├── runtime/               # 런타임 설정 파일 저장소
+│   └── config.json        # 봇의 설정 파일
+├── ui/                    # 사용자 인터페이스
+│   └── streamlit_app.py   # Streamlit 기반 설정 편집 UI
+├── README.md              # 프로젝트 설명서
+└── requirements.txt       # 필요한 Python 패키지 목록
 ```
 
-## 🛠 시작하기
+### 주요 파일 설명
 
-### 1. 사전 준비
+- **server/bot.py**: 트레이딩 봇의 핵심 파일로, 설정에 따라 거래를 실행합니다.
+- **runtime/config.json**: 봇의 동작을 제어하는 설정 파일입니다. (예: 전략, 거래 금액 등)
+- **ui/streamlit_app.py**: 설정 파일을 편집할 수 있는 간단한 웹 인터페이스입니다.
+- **server/api.py**: REST API를 통해 설정을 변경하거나 봇을 제어할 수 있습니다.
 
--   Python 3.8 이상
--   업비트 계정 및 API Key (`자산조회`, `주문조회`, `주문하기` 권한)
--   OpenAI API Key (유료 계정 권장)
--   Google Gemini API Key (AI Studio에서 발급)
+---
 
-### 2. 설치
+## 작동 원리
 
-1.  **저장소 복제 및 이동**
-    ```bash
-    git clone https://github.com/your-username/upbit-ai-trader.git
-    cd upbit-ai-trader
-    ```
+1. **설정 파일 로드**: `runtime/config.json`에서 봇의 동작에 필요한 설정을 불러옵니다.
+2. **전략 선택**: 설정에 따라 RSI, 변동성 돌파, 듀얼 모멘텀 등의 전략을 실행합니다.
+3. **거래 실행**: 선택한 전략에 따라 업비트 API를 통해 매수/매도를 실행합니다.
+4. **자금 관리**: 켈리 공식을 사용해 거래 금액을 동적으로 조정합니다.
+5. **설정 변경 감지**: 설정 파일이 변경되면 자동으로 새로운 설정을 반영합니다.
 
-2.  **가상 환경 생성 (권장)**
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # Windows: venv\Scripts\activate
-    ```
+---
 
-3.  **필요 라이브러리 설치**
-    ```bash
-    pip install -r requirements.txt
-    ```
+## 사용 방법
 
-### 3. 설정 (`config.py`)
-
-프로젝트 루트에 `config.py` 파일을 생성하고 아래 내용을 참고하여 키와 설정을 입력합니다.
-
-```python
-# config.py
-
-# --- API Keys ---
-UPBIT_ACCESS_KEY = "YOUR_UPBIT_ACCESS_KEY"
-UPBIT_SECRET_KEY = "YOUR_UPBIT_SECRET_KEY"
-
-OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"
-OPENAI_MODEL = "gpt-5.1-nano"  # 사용 가능한 최신 모델로 변경 가능
-
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
-GEMINI_MODEL = "gemini-2.5-flash" # 사용 가능한 최신 모델로 변경 가능
-
-# --- Strategy Settings ---
-MARKET = "KRW-BTC"       # 매매할 코인
-TIMEFRAME = "minute5"    # 캔들 기준 (e.g., "minute5", "minute30", "day")
-TRADE_AMOUNT_KRW = 6000  # 1회 매수 금액 (KRW, 업비트 최소 주문 금액 이상)
-
-# --- 1차 필터 (Technical Indicator) ---
-RSI_PERIOD = 14
-RSI_OVERSOLD = 40        # 이 값 이하면 '매수' 기회로 포착 -> AI에게 질문
-RSI_OVERBOUGHT = 70      # 이 값 이상이면 '매도' 기회로 포착 -> AI에게 질문
-
-# --- 2차 필터 (AI Ensemble) ---
-# 'UNANIMOUS': 두 AI가 모두 동의해야 매매 (안전)
-# 'ANY': 둘 중 하나라도 동의하면 매매 (공격적)
-ENSEMBLE_STRATEGY = "UNANIMOUS"
-```
-
-### 4. 실행
+### 1. 개발 환경 준비
 
 ```bash
-python bot.py
+# 가상환경 생성 및 활성화
+python -m venv venv
+source venv/bin/activate
+
+# 필요한 패키지 설치
+pip install -r requirements.txt
 ```
 
-## 🧠 작동 로직
+### 2. 서버 실행
 
-1.  **데이터 수집**: `upbit_api.py`가 업비트에서 지정된 마켓의 캔들 데이터(OHLCV)를 주기적으로 가져옵니다.
-2.  **데이터 가공**: `strategy.py`가 수집된 데이터를 바탕으로 RSI, 볼린저 밴드, 이동평균선 등 기술적 보조지표를 계산합니다.
-3.  **1차 필터 (기술적 분석)**: `strategy.py`가 RSI 지표를 분석하여 1차 신호를 생성합니다.
-    -   `RSI < 40` (과매도 구간): "매수(BUY)" 신호 발생 가능성 감지
-    -   `RSI > 70` (과매수 구간): "매도(SELL)" 신호 발생 가능성 감지
-4.  **2차 필터 (AI 앙상블 분석)**: 1차 신호가 발생한 경우에만 `ai_analyst.py`가 작동합니다.
-    -   최근 차트 데이터와 보조지표를 AI가 이해하기 쉬운 JSON 형태로 변환합니다.
-    -   변환된 데이터를 **OpenAI(GPT-4o)**와 **Google(Gemini)**에게 동시에 전송하여 시장 상황 분석을 요청합니다.
-    -   각 AI는 시장을 분석하고 `"BUY"`, `"SELL"`, `"HOLD"` 중 하나의 의견과 그 근거를 반환합니다.
-5.  **최종 판단 및 실행**: `bot.py`가 `ENSEMBLE_STRATEGY` 설정에 따라 AI들의 의견을 종합합니다.
-    -   `UNANIMOUS` 설정 시: `RSI(BUY)` + `OpenAI(BUY)` + `Gemini(BUY)` 조건이 모두 충족될 때 최종 매수 주문을 실행합니다.
-    -   조건이 하나라도 불만족 시, 거래를 실행하지 않고 관망(HOLD)합니다.
+```bash
+# FastAPI 서버 실행
+uvicorn server.api:app --host 127.0.0.1 --port 8000 --reload
+```
 
-## ⚠️ 추가 주의사항
+### 3. Streamlit UI 실행
 
--   **API 비용**: OpenAI API는 사용량에 따라 과금됩니다. 봇의 루프 간격이나 RSI 민감도를 조절하여 불필요한 API 호출을 관리하세요.
--   **IP 제한**: 업비트 API는 보안을 위해 등록된 IP 주소에서만 요청을 허용합니다. 봇을 실행하는 서버의 IP가 고정되어 있는지 확인하세요.
--   **최소 주문 금액**: 업비트의 최소 주문 금액 정책(예: 5,000 KRW)을 확인하고 `TRADE_AMOUNT_KRW`를 그 이상으로 설정해야 합니다.
+```bash
+# Streamlit 기반 설정 편집 UI 실행
+streamlit run ui/streamlit_app.py
+```
+
+### 4. 봇 실행
+
+```bash
+# 트레이딩 봇 실행
+python -m server.bot
+```
+
+---
+
+## 설정 파일 예시
+
+`runtime/config.json` 파일은 봇의 동작을 제어하는 설정 파일입니다. 주요 필드는 다음과 같습니다:
+
+```json
+{
+  "strategy_name": "RSI",  // 사용할 전략 (RSI, VolatilityBreakout, DualMomentum)
+  "market": "KRW-BTC",    // 거래할 마켓
+  "order_settings": {
+    "trade_amount_krw": 100000  // 거래 금액 (KRW)
+  },
+  "use_kelly_criterion": true,  // 켈리 공식 사용 여부
+  "kelly_criterion": {
+    "win_rate": 0.6,            // 승률
+    "payoff_ratio": 2.0,        // 보상비율
+    "fraction": 0.5             // 투자 비율
+  }
+}
+```
+
+---
+
+## 자주 묻는 질문 (FAQ)
+
+### Q1. 이 봇은 어떻게 동작하나요?
+A1. 설정 파일(runtime/config.json)에 따라 트레이딩 전략을 실행하며, 업비트 API를 통해 자동으로 매수/매도를 수행합니다.
+
+### Q2. 새로운 전략을 추가할 수 있나요?
+A2. 네, `server/strategy.py` 파일에 새로운 전략을 구현하고 설정 파일에 추가하면 됩니다.
+
+### Q3. 이 봇은 안전한가요?
+A3. 민감 정보(API 키)는 `.env` 파일에 저장되며, 운영 환경에서는 추가적인 보안 조치를 권장합니다.
+
+---
+
+## 향후 작업
+
+- **UI 개선**: 더 직관적인 사용자 인터페이스 제공
+- **백테스트 기능 추가**: 과거 데이터를 기반으로 전략 성능 평가
+- **추가 전략 구현**: All-Weather, AI 기반 전략 등
+- **보안 강화**: 인증 및 접근 제어 기능 추가
+
+---
+
+이 프로젝트에 기여하거나 질문이 있다면 언제든지 연락주세요! 😊

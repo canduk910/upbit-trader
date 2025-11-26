@@ -1,0 +1,35 @@
+{
+  "strategy_name": "VolatilityBreakout",
+  "market": "KRW-BTC",
+  "timeframe": "minute5",
+  "candle_count": 200,
+  "loop_interval_sec": 5,
+  "order_settings": {
+    "min_order_amount": 5500,
+    "trade_amount_krw": 6000
+  },
+  "use_kelly_criterion": true,
+  "kelly_criterion": {
+    "win_rate": 0.65,
+    "payoff_ratio": 1.2,
+    "fraction": 0.5
+  },
+  "strategy_params": {
+    "RSI": {
+      "period": 14,
+      "oversold": 30,
+      "overbought": 70
+    },
+    "VolatilityBreakout": {
+      "k_value": 0.5
+    },
+    "DualMomentum": {
+      "window": 12
+    }
+  },
+  "ai_ensemble": {
+    "strategy": "UNANIMOUS",
+    "openai_model": "gpt-5.1-nano",
+    "gemini_model": "gemini-2.5-flash"
+  }
+}
