@@ -245,40 +245,39 @@ trap 'cleanup; exit' INT TERM EXIT
 
 # Docker mode: delegate to docker compose
 if [ "$USE_DOCKER" = true ]; then
-  SERVICES=()
-  case "$MODE" in
-    all)
-      SERVICES=(backend ui bot)
-      if [ "$START_REDIS" = true ]; then
+    SERVICES=()
+    case "$MODE" in
+      all)
+        SERVICES=(backend ui bot)
+        # when starting all, include redis by default
         SERVICES+=(redis)
-      fi
-      ;;
-    backend)
-      SERVICES=(backend)
-      ;;
-    ui)
-      SERVICES=(ui)
-      ;;
-    bot)
-      SERVICES=(bot)
-      ;;
-    *)
-      echo "Unknown mode for docker: $MODE" >&2
-      exit 1
-      ;;
-  esac
+        ;;
+      backend)
+        SERVICES=(backend redis)
+        ;;
+      ui)
+        SERVICES=(ui)
+        ;;
+      bot)
+        SERVICES=(bot redis)
+        ;;
+      *)
+        echo "Unknown mode for docker: $MODE" >&2
+        exit 1
+        ;;
+    esac
 
-  if [ "$DETACHED" = true ]; then
-    echo "Starting services with docker compose (detached): ${SERVICES[*]}" >&2
-    docker compose up --build -d "${SERVICES[@]}" || { echo "docker compose up failed" >&2; exit 1; }
-    docker compose ps || true
-    exit 0
-  else
-    echo "Starting services with docker compose (foreground): ${SERVICES[*]}" >&2
-    docker compose up --build "${SERVICES[@]}"
-    exit $?
+    if [ "$DETACHED" = true ]; then
+      echo "Starting services with docker compose (detached): ${SERVICES[*]}" >&2
+      docker compose up --build -d "${SERVICES[@]}" || { echo "docker compose up failed" >&2; exit 1; }
+      docker compose ps || true
+      exit 0
+    else
+      echo "Starting services with docker compose (foreground): ${SERVICES[*]}" >&2
+      docker compose up --build "${SERVICES[@]}"
+      exit $?
+    fi
   fi
-fi
 
 wait_for_backend() {
   # Wait up to specified timeout for backend /health to return 200

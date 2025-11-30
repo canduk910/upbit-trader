@@ -1,31 +1,32 @@
-"""AI Ensemble analyzer (OpenAI + Gemini).
-
-This module is defensive: if OpenAI or Gemini SDKs are not installed or API keys
-are not provided, the module still imports successfully and the analyzer will
-fall back to a safe behavior (returning 'HOLD').
-"""
-
-# -- Python imports
 import json
 import concurrent.futures
 import server.config as config
 from server.logger import log
 
-# Try imports but don't fail module import if libraries are missing
+# OpenAI SDK
+# Defensive imports
 try:
     import openai
 except Exception:
     openai = None
 
+# Gemini SDK
+# Defensive imports
 try:
     import google.generativeai as genai
 except Exception:
     genai = None
 
-
+# AI 자문 앙상블 분석기 클래스
+# OpenAI와 Gemini 모델을 병렬로 호출하여 TradingContext에 대한 TradingDecision을 생성
+# 두 모델의 출력을 결합하여 최종 매매 결정을 내림
+# OpenAI 또는 Gemini SDK가 설치되지 않았거나 API 키가 제공되지 않은 경우에도
+# 모듈이 정상적으로 임포트되며 분석기는 안전한 동작('HOLD' 반환)으로 대체됨
 class EnsembleAnalyzer:
+
+    # 초기화 메서드
     def __init__(self):
-        # Initialize flags and clients defensively
+        # 멤버 변수 초기화
         self.openai_client = None
         self.openai_model = None
         self.gemini_model = None
@@ -38,15 +39,16 @@ class EnsembleAnalyzer:
                 if not getattr(config, 'OPENAI_API_KEY', None):
                     log.warning('OPENAI_API_KEY missing in config; OpenAI disabled.')
                 else:
-                    # Depending on openai package version, the client init may differ.
-                    # Try common initialization patterns.
+                    # 우선: OpenAI client 인스턴스 생성 시도
+                    # 참고: openai.OpenAI()는 openai 패키지 버전 0.27.0 이상에서 지원
+                    # 그 이하 버전에서는 openai.api_key 설정 방식으로 동작
+                    # 따라서 두 방식을 모두 시도
                     try:
-                        self.openai_client = openai.OpenAI(api_key=config.OPENAI_API_KEY)
+                        self.openai_client = openai.OpenAI(api_key=config.OPENAI_API_KEY) # 클라이언트 인스턴스
                     except Exception:
-                        # fallback: set api key on module
                         try:
-                            openai.api_key = config.OPENAI_API_KEY
-                            self.openai_client = openai
+                            openai.api_key = config.OPENAI_API_KEY # 전역 설정
+                            self.openai_client = openai # 패키지 자체를 클라이언트로 사용
                         except Exception as e:
                             log.warning(f'Failed to init OpenAI client: {e}')
                     self.openai_model = getattr(config, 'OPENAI_MODEL', None)
@@ -62,11 +64,18 @@ class EnsembleAnalyzer:
                 if not getattr(config, 'GEMINI_API_KEY', None):
                     log.warning('GEMINI_API_KEY missing in config; Gemini disabled.')
                 else:
-                    genai.configure(api_key=config.GEMINI_API_KEY)
-                    self.gemini_model = genai.GenerativeModel(getattr(config, 'GEMINI_MODEL', None))
+                    # Gemini 클라이언트 구성
+                    genai.configure(api_key=config.GEMINI_API_KEY) # 전역 구성
+                    self.gemini_model = genai.GenerativeModel(getattr(config, 'GEMINI_MODEL', None)) # 모델 인스턴스
             except Exception as e:
                 log.warning(f'Failed to init Gemini client: {e}')
 
+    # 시스템 프롬프트 생성 메서드
+    # OpenAI 및 Gemini에 동일한 시스템 프롬프트 사용
+    # 생성된 시스템 프롬프트는 업비트 현물 계좌 운용 퀀트 트레이더 AI 역할을 정의
+    # TradingContext 입력 데이터 구조와 TradingDecision 출력 스키마를 상세히 명시
+    # 또한, 매매 판단 원칙과 제약조건을 구체적으로 기술
+    # 반환값: (str) 시스템 프롬프트 텍스트
     def _get_system_prompt(self):
         return """
         너는 업비트(UPBIT) 현물 계좌를 운용하는 퀀트/시스템 트레이더 AI다.
@@ -138,6 +147,11 @@ class EnsembleAnalyzer:
         5. 항상 계좌 전체 리스크를 고려해 보수적으로 의사결정을 내린다.
         """
 
+    # 사용자 프롬프트 생성 메서드
+    # TradingContext 딕셔너리를 JSON 문자열로 직렬화하여 포함
+    # 생성된 사용자 프롬프트는 시스템 프롬프트와 함께 AI 모델에 전달됨
+    # TradingContext 딕셔너리를 JSON 문자열로 직렬화하여 포함
+    # 반환값: (str) 사용자 프롬프트 텍스트
     def _get_user_prompt(self, trading_context: dict):
         """TradingContext dict를 그대로 JSON 문자열로 직렬화해서 보낸다."""
         try:
@@ -158,24 +172,28 @@ class EnsembleAnalyzer:
         {context_json}
         """
 
+    # OpenAI에게 질문 메서드
+    # TradingDecision JSON 스키마 기준
+    # 반환값: (dict) {"source": "OpenAI", "decision": "...", "reason": "..."}
     def _ask_openai(self, system_prompt, user_prompt):
-        """OpenAI에게 질문 (TradingDecision JSON 스키마 기준)"""
         try:
+            # OpenAI ChatCompletion API 호출
             response = self.openai_client.chat.completions.create(
-                model=self.openai_model,
+                model=self.openai_model,                            # 모델 이름
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
-                ],
-                response_format={"type": "json_object"}
+                ],                                                  # 메시지 목록
+                response_format={"type": "json_object"}             # 응답 형식 지정
             )
-            raw = response.choices[0].message.content
-            result = json.loads(raw)
+            raw = response.choices[0].message.content # 응답 원문
+            result = json.loads(raw) # JSON 파싱
 
             decision = "HOLD"
             reason = ""
-            target_symbol = getattr(config, "MARKET", None)
+            target_symbol = getattr(config, "MARKET", None) # 타겟 심볼 설정
 
+            # 새 스키마 호환: {"decisions": [ ... ]}
             decisions = result.get("decisions")
             if isinstance(decisions, list) and decisions:
                 if target_symbol:
@@ -189,15 +207,17 @@ class EnsembleAnalyzer:
                 else:
                     target = decisions[0]
 
+                # 매매 결정 및 이유 추출
                 action = str(target.get("action", "HOLD")).upper()
                 decision = action if action in ["BUY", "SELL", "HOLD"] else "HOLD"
 
-                reasoning = target.get("reasoning", {})
-                summary = reasoning.get("summary")
-                tech = reasoning.get("technical_factors")
-                risk = reasoning.get("risk_factors")
+                reasoning = target.get("reasoning", {})     # 이유 딕셔너리
+                summary = reasoning.get("summary")          # 요약
+                tech = reasoning.get("technical_factors")   # 기술적 요인
+                risk = reasoning.get("risk_factors")        # 리스크 요인
 
                 parts = []
+                # 이유 구성
                 if summary:
                     parts.append(str(summary))
                 if tech:
@@ -223,12 +243,17 @@ class EnsembleAnalyzer:
             log.error(f"OpenAI Error: {e}")
             return {"source": "OpenAI", "decision": "ERROR", "reason": str(e)}
 
-
+    # Gemini에게 질문 메서드
+    # TradingDecision JSON 스키마 기준
+    # 반환값: (dict) {"source": "Gemini", "decision": "...", "reason": "..."}
+    # 질문 메서드
     def _ask_gemini(self, system_prompt, user_prompt):
-        """Gemini에게 질문 (TradingDecision JSON 스키마 기준)"""
         try:
+            # Gemini 모델에 프롬프트 전달
             full_prompt = system_prompt + "\n\n" + user_prompt
 
+            # Gemini 콘텐츠 생성 API 호출
+            # 응답 형식을 JSON으로 지정
             response = self.gemini_model.generate_content(
                 full_prompt,
                 generation_config={"response_mime_type": "application/json"}
@@ -240,6 +265,7 @@ class EnsembleAnalyzer:
             reason = ""
             target_symbol = getattr(config, "MARKET", None)
 
+            # 새 스키마 호환: {"decisions": [ ... ]}
             decisions = result.get("decisions")
             if isinstance(decisions, list) and decisions:
                 if target_symbol:
@@ -253,13 +279,14 @@ class EnsembleAnalyzer:
                 else:
                     target = decisions[0]
 
+                # 매매 결정 및 이유 추출
                 action = str(target.get("action", "HOLD")).upper()
                 decision = action if action in ["BUY", "SELL", "HOLD"] else "HOLD"
 
-                reasoning = target.get("reasoning", {})
-                summary = reasoning.get("summary")
-                tech = reasoning.get("technical_factors")
-                risk = reasoning.get("risk_factors")
+                reasoning = target.get("reasoning", {})     # 이유 딕셔너리
+                summary = reasoning.get("summary")          # 요약
+                tech = reasoning.get("technical_factors")   # 기술적 요인
+                risk = reasoning.get("risk_factors")        # 리스크 요인
 
                 parts = []
                 if summary:
@@ -286,19 +313,21 @@ class EnsembleAnalyzer:
             log.error(f"Gemini Error: {e}")
             return {"source": "Gemini", "decision": "ERROR", "reason": str(e)}
 
-
+    # 분석 메서드 (앙상블)
+    # TradingContext 딕셔너리를 두 AI 모델에 병렬로 전달
+    # 각 모델의 결과를 수집하여 앙상블 전략에 따라 최종 매매 결정 생성
+    # 반환값: (str) 최종 매매 결정 ('BUY', 'SELL', 'HOLD')
     def analyze(self, trading_context: dict):
-        """
-        두 AI에게 TradingContext를 전달하고 결과를 종합(Ensemble)
-        """
+        # 시스템 및 사용자 프롬프트 생성
         system_prompt = self._get_system_prompt()
         user_prompt = self._get_user_prompt(trading_context)
 
         log.info(f"Asking both OpenAI & Gemini simultaneously...")
 
+        # 병렬로 두 AI 모델에 질문
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future_openai = executor.submit(self._ask_openai, system_prompt, user_prompt)
-            future_gemini = executor.submit(self._ask_gemini, system_prompt, user_prompt)
+            future_openai = executor.submit(self._ask_openai, system_prompt, user_prompt) # OpenAI 질문
+            future_gemini = executor.submit(self._ask_gemini, system_prompt, user_prompt) # Gemini 질문
 
             result_openai = future_openai.result()
             result_gemini = future_gemini.result()
@@ -311,12 +340,16 @@ class EnsembleAnalyzer:
 
         final_decision = 'HOLD'
 
+        # 오류 감지 시 기본 HOLD
         if decision_openai == 'ERROR' or decision_gemini == 'ERROR':
             log.warning(
                 f"AI error detected. Fallback to HOLD. OpenAI={decision_openai}, Gemini={decision_gemini}"
             )
             return 'HOLD'
 
+        # 앙상블 전략 적용
+        # 1. 다수결 원칙 전략
+        # 양쪽 모델이 동일한 BUY 또는 SELL 신호를 낸 경우에만 해당 신호 채택
         if config.ENSEMBLE_STRATEGY == 'MAJORITY':
             if decision_openai == decision_gemini and decision_openai in ['BUY', 'SELL']:
                 final_decision = decision_openai
@@ -325,7 +358,8 @@ class EnsembleAnalyzer:
                 log.info(
                     f"==> Disagreement (OpenAI:{decision_openai} vs Gemini:{decision_gemini}). Result: HOLD"
                 )
-
+        # 2. ANY 전략
+        # BUY 또는 SELL 신호가 하나라도 있으면 해당 신호 채택
         elif config.ENSEMBLE_STRATEGY == 'ANY':
             if 'BUY' in [decision_openai, decision_gemini]:
                 final_decision = 'BUY'

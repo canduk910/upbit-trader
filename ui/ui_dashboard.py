@@ -11,6 +11,13 @@ from plotly.subplots import make_subplots
 import time
 import random
 import os
+# Ensure process timezone is KST (Asia/Seoul) so Streamlit displays local times correctly
+os.environ.setdefault('TZ', 'Asia/Seoul')
+try:
+    time.tzset()
+except Exception:
+    # time.tzset may not be available on all platforms (Windows), ignore if unavailable
+    pass
 
 # Import configuration helpers from server package
 try:
@@ -114,93 +121,15 @@ def api_request(method: str, path: str, params=None, json=None, timeout=10):
 
 
 # --- Upbit public klines helper (cached) ---
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=10)
 def fetch_klines_cached(market: str, timeframe: str = 'minute1', count: int = 200) -> pd.DataFrame | None:
-    """Fetch klines from Upbit public API and return a DataFrame with columns: time, open, high, low, close, volume.
-    Handles HTTP 429 by retrying with exponential backoff. Returns None on error.
     """
-    base = 'https://api.upbit.com'
-    tf = timeframe.lower()
-    if tf.startswith('minute'):
-        try:
-            n = int(tf.replace('minute',''))
-            endpoint = f'/v1/candles/minutes/{n}'
-        except Exception:
-            endpoint = '/v1/candles/minutes/1'
-    elif tf in ('day','days'):
-        endpoint = '/v1/candles/days'
-    elif tf in ('week','weeks'):
-        endpoint = '/v1/candles/weeks'
-    elif tf in ('month','months'):
-        endpoint = '/v1/candles/months'
-    else:
-        endpoint = f'/v1/candles/{tf}'
-
-    params = {
-        'market': market,
-        'count': count
-    }
-    url = base + endpoint
-    headers = {'Accept': 'application/json', 'User-Agent': 'UpbitTrader/1.0'}
-
-    max_retries = 5
-    backoff_base = 1.0
-    last_exc = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = requests.get(url, params=params, headers=headers, timeout=10)
-            # Rate limit handling: Upbit returns 429 when limit exceeded
-            if resp.status_code == 429:
-                # exponential backoff with jitter to avoid thundering herd
-                wait = backoff_base * (2 ** (attempt - 1))
-                jitter = random.uniform(0, 0.5)
-                total_wait = wait + jitter
-                st.warning(f'Upbit API rate limit hit (429). 재시도 {attempt}/{max_retries} — {total_wait:.1f}s 후 재시도합니다.')
-                time.sleep(total_wait)
-                last_exc = requests.exceptions.HTTPError('429 Too Many Requests')
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            if not data:
-                return None
-            # Upbit returns newest first; convert to ascending
-            df = pd.DataFrame(data)
-            # expected keys: candle_date_time_kst, opening_price, high_price, low_price, trade_price, candle_acc_trade_volume
-            df = df.rename(columns={
-                'candle_date_time_kst': 'time',
-                'opening_price': 'open',
-                'high_price': 'high',
-                'low_price': 'low',
-                'trade_price': 'close',
-                'candle_acc_trade_volume': 'volume'
-            })
-            # keep only relevant columns if present
-            cols = [c for c in ['time','open','high','low','close','volume'] if c in df.columns]
-            df = df[cols]
-            # convert types
-            if 'time' in df.columns:
-                df['time'] = pd.to_datetime(df['time'])
-            for col in ['open','high','low','close','volume']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-            df = df.sort_values('time', ascending=True).reset_index(drop=True)
-            return df
-        except requests.exceptions.HTTPError as e:
-            last_exc = e
-            # If not rate-limited, break (other HTTP errors unlikely to be resolved by retrying)
-            if getattr(e.response, 'status_code', None) != 429:
-                st.warning(f'클라인 데이터 로드 실패 ({market} {timeframe}): {e}')
-                break
-            # else loop will retry
-        except Exception as e:
-            last_exc = e
-            st.warning(f'클라인 데이터 로드 실패 ({market} {timeframe}): {e}')
-            # for transient network errors, wait then retry
-            time.sleep(backoff_base * (2 ** (attempt - 1)))
-            continue
-
-    # Retries exhausted
-    st.error(f'업비트 API 호출 한도 초과 또는 네트워크 오류가 계속 발생합니다. 잠시 후 다시 시도하세요. ({market} {timeframe})')
+    UI-side fetch function disabled.
+    The UI must not call Upbit public API directly — always go through the backend `/klines_batch` endpoint.
+    This function returns None to force the UI to rely on backend data and avoid causing 429 Too Many Requests.
+    """
+    # Return None immediately to prevent direct Upbit calls from the UI.
+    st.warning('UI는 직접 Upbit 호출을 하지 않습니다. 백엔드의 prefetch가 완료될 때까지 대기하세요.')
     return None
 
 
@@ -240,6 +169,73 @@ def fetch_klines_batch_from_backend(tickers: list[str], timeframe: str = 'minute
     except Exception as e:
         st.warning(f'백엔드 batch klines 호출 실패: {e}')
         return {}
+
+
+def _normalize_klines_df(df: pd.DataFrame | None, min_length: int = 30) -> pd.DataFrame | None:
+    """Validate and normalize a kline DataFrame for plotting.
+    - Ensures time column exists and is datetime
+    - Renames common Upbit keys if needed
+    - Sorts ascending by time, drops duplicate timestamps
+    - Converts numeric columns and fills small gaps
+    - Returns None if data is invalid
+    """
+    if df is None:
+        return None
+    # Accept list-of-dicts as well
+    if not isinstance(df, pd.DataFrame):
+        try:
+            df = pd.DataFrame(df)
+        except Exception:
+            return None
+
+    # Map common Upbit field names to expected ones
+    rename_map = {
+        'candle_date_time_kst': 'time',
+        'opening_price': 'open',
+        'high_price': 'high',
+        'low_price': 'low',
+        'trade_price': 'close',
+        'candle_acc_trade_volume': 'volume'
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    # required columns
+    required = ['time', 'open', 'high', 'low', 'close', 'volume']
+    if 'time' not in df.columns:
+        return None
+
+    # time -> datetime
+    try:
+        df['time'] = pd.to_datetime(df['time'])
+    except Exception:
+        try:
+            df['time'] = pd.to_datetime(df['time'].astype(str))
+        except Exception:
+            return None
+
+    # sort ascending and dedupe
+    df = df.sort_values('time', ascending=True).reset_index(drop=True)
+    if df['time'].duplicated().any():
+        df = df[~df['time'].duplicated(keep='last')].reset_index(drop=True)
+
+    # ensure numeric
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        else:
+            df[col] = pd.NA
+
+    # fill small gaps for price columns
+    try:
+        df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].ffill().bfill()
+        df['volume'] = df['volume'].fillna(0)
+    except Exception:
+        pass
+
+    if len(df) < min_length:
+        st.warning(f'차트에 필요한 데이터가 부족합니다: {len(df)}개 (최소 {min_length} 필요)')
+        return df
+    return df
 
 
 # --- Indicator helpers and plotting ---
@@ -476,6 +472,26 @@ def render_screening_page():
             # Try batch fetch from backend to reduce Upbit calls
             tickers = [it.get('ticker') for it in items]
             backend_data = fetch_klines_batch_from_backend(tickers, timeframe=params.get('timeframe','minute15'), count=200)
+            # If some tickers are missing in the backend result (None), retry via backend a few times
+            missing = [t for t in tickers if backend_data.get(t) is None]
+            if missing:
+                retries = 3
+                for attempt in range(1, retries+1):
+                    if not missing:
+                        break
+                    # request only the missing tickers as a batch
+                    try:
+                        more = fetch_klines_batch_from_backend(missing, timeframe=params.get('timeframe','minute15'), count=200)
+                        for k, v in (more or {}).items():
+                            backend_data[k] = v
+                        # recompute missing list
+                        missing = [t for t in tickers if backend_data.get(t) is None]
+                    except Exception:
+                        # ignore and backoff
+                        pass
+                    if missing and attempt < retries:
+                        time.sleep(0.8 * attempt)
+
             # Render rows of 2 columns based on actual display_n
             for row_start in range(0, display_n, 2):
                 cols = st.columns(2, gap='small')
@@ -491,23 +507,23 @@ def render_screening_page():
                     with cols[col_idx]:
                         st.subheader(f"{idx+1}. {ticker} — vol={vol:.4f}")
                         df = backend_data.get(ticker)
-                        if df is None:
-                            with st.spinner(f'{ticker} 차트 데이터 로딩 중...'):
-                                df = fetch_klines_cached(ticker, params.get('timeframe','minute15'), count=500)
-                        if df is None or df.empty:
-                            st.info('차트 데이터를 불러올 수 없습니다.')
+                        # normalize/check df before plotting
+                        df = _normalize_klines_df(df, min_length=50)
+                        if df is None or (hasattr(df, 'empty') and df.empty):
+                            # Backend could not provide data (maybe prefetch miss or Upbit limit).
+                            # Show a user-friendly message and skip direct Upbit calls from the UI to avoid causing a 429.
+                            st.info('차트 데이터를 아직 불러올 수 없습니다. 잠시 후 다시 시도하세요. (백엔드에서 데이터 수집 중일 수 있음)')
                         else:
                             # Create a more compact chart for the grid
                             fig = plot_candles_with_indicators(df, ticker, ma_windows=[ma1, ma2], rsi_period=int(rsi_p))
                             fig.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=20))
                             st.plotly_chart(fig, width='stretch')
-                        # slight pause to avoid tight loop/rate limits
-                        time.sleep(0.08)
+                    # slight pause to avoid tight loop/rate limits
+                    time.sleep(0.08)
             # show count info
             st.caption(f"표시된 종목: {display_n} / 요청한 TopN: {requested_n}")
         except Exception as e:
             st.error(str(e))
-
 
 
 def render_watcher_page(cfg: Dict[str, Any]):

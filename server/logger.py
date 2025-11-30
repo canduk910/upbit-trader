@@ -4,6 +4,7 @@ from logging.handlers import RotatingFileHandler
 import time
 import threading
 import os
+from pathlib import Path
 
 class DedupFilter(logging.Filter):
     """Filter that suppresses duplicate log messages within a time window.
@@ -55,9 +56,26 @@ def setup_logger(name='UpbitBotLogger', log_file='trading_bot.log', level=loggin
     logger.addHandler(stream_handler)
 
     # 2. 파일(RotatingFile) 핸들러
-    # 5MB 크기로 3개의 로그 파일 유지
+    # Ensure logs directory under project root exists and use it as default location
+    try:
+        project_root = Path(__file__).resolve().parents[1]
+    except Exception:
+        project_root = Path(os.getcwd())
+
+    logs_dir = project_root / 'logs'
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # fallback to current working directory if creation fails
+        logs_dir = Path(os.getcwd())
+
+    # If log_file is an absolute path, keep it; otherwise place it under logs_dir
+    log_path = Path(log_file)
+    if not log_path.is_absolute():
+        log_path = logs_dir / log_path
+
     file_handler = RotatingFileHandler(
-        log_file,
+        str(log_path),
         maxBytes=5*1024*1024,
         backupCount=3,
         encoding='utf-8'
@@ -72,6 +90,50 @@ def setup_logger(name='UpbitBotLogger', log_file='trading_bot.log', level=loggin
         window = 2.0
     dedup = DedupFilter(window_seconds=window)
     logger.addFilter(dedup)
+
+    # Detect stray log files named 'trading_bot.log' outside the canonical logs directory.
+    try:
+        # look for files named like the logger filename under project root
+        stray_paths = []
+        # resolved canonical path of the active log file
+        try:
+            canonical_log = Path(str(log_path)).resolve()
+        except Exception:
+            canonical_log = Path(str(log_path))
+
+        for p in project_root.rglob('trading_bot.log'):
+            try:
+                p_res = p.resolve()
+            except Exception:
+                p_res = p
+            # skip the canonical log file under logs_dir
+            if p_res == canonical_log:
+                continue
+            # skip files inside the logs directory (they are allowed)
+            try:
+                if logs_dir.resolve() in p_res.parents:
+                    continue
+            except Exception:
+                pass
+            stray_paths.append(str(p_res))
+
+        if stray_paths:
+            msg = (
+                f"Found unexpected 'trading_bot.log' files outside '{logs_dir}': {stray_paths}. "
+                "These files are considered abnormal; move or remove them so logs are centralized."
+            )
+            # Print to stdout for visibility during container startup and also log a warning.
+            try:
+                print(msg, file=sys.stderr)
+            except Exception:
+                pass
+            try:
+                logger.warning(msg)
+            except Exception:
+                pass
+    except Exception:
+        # don't fail logger setup because of stray-file check
+        pass
 
     return logger
 
