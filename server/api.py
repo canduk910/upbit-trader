@@ -71,6 +71,9 @@ _prefetch_semaphore: Optional[threading.BoundedSemaphore] = None
 # (기본값 600초로 설정하여 중복 Upbit 요청 감소, 실시간성은 다소 희생, 값이 클수록 캐시 지속시간 증가)
 _KLINES_CACHE_TTL = int(os.getenv('KLINES_CACHE_TTL', str(600)))  # default 600s
 
+# Balances cache TTL (seconds)
+_BALANCES_CACHE_TTL = int(os.getenv('BALANCES_CACHE_TTL', '15'))
+
 # FastAPI 앱 생성 및 수명 주기 관리
 @asynccontextmanager
 async def lifespan(app: FastAPI): # 수명 주기 관리
@@ -105,6 +108,14 @@ class KlinesBatchRequest(BaseModel):
     tickers: List[str]
     timeframe: Optional[str] = 'minute15'
     count: Optional[int] = 100
+
+# 포지션 모델 정의
+class Position(BaseModel):
+    ticker: str
+    amount: float
+    avg_price: float
+    current_price: float
+    pnl: float
 
 # --- Background Prefetch Scheduler 및 캐시 관리 ---
 # 전역 상태 변수들
@@ -232,6 +243,20 @@ def _rate_limited_get_klines(ticker_local: str, timeframe: str, count: int):
 # 업비트 공용 API 인스턴스
 _upbit_public = UpbitAPI()
 
+# 업비트 인증(Private) API 인스턴스
+try:
+    access = getattr(config, 'UPBIT_ACCESS_KEY', None)
+    secret = getattr(config, 'UPBIT_SECRET_KEY', None)
+    if access and secret:
+        _upbit_private = UpbitAPI(access_key=access, secret_key=secret)
+        log.info('Upbit private API initialized with provided keys')
+    else:
+        _upbit_private = None
+        log.warning('Upbit API keys not provided: private endpoints will be unavailable')
+except Exception as e:
+    _upbit_private = None
+    log.warning(f'Failed to initialize Upbit private API: {e}')
+
 # 스케쥴러 스레드 및 제어 변수
 _prefetch_thread: Optional[threading.Thread] = None
 _prefetch_stop = threading.Event()
@@ -332,33 +357,40 @@ def start_prefetch_scheduler(interval: int = 30):
     if _prefetch_thread is not None and _prefetch_thread.is_alive():
         return
     _prefetch_stop.clear()
-    # If Redis unavailable, bump default interval to reduce Upbit calls
+    # Redis 미사용 시 기본 간격 증가
+    # Upbit 호출 부담 축소를 위한 조치
+    # 기본 최소 60초
     if _redis_client is None:
         interval = max(interval, 60)
         log.info('Redis not connected: starting prefetch with interval %s seconds', interval)
-    # ensure smaller default batch if no redis
+    # Redis 미사용 시 기본 배치 크기 축소
     if _redis_client is None:
         try:
-            # reduce batch size to 3 if not configured
+            # 배치사이즈 기본 3으로 축소, config에 없으면 설정
             if 'prefetch_batch_size' not in config._config:
                 config._config['prefetch_batch_size'] = 3
         except Exception:
             pass
-    # initialize prefetch rate limiter and semaphore based on runtime config
-    global _prefetch_token_bucket, _prefetch_semaphore
+    # 프리페치 레이트 리미터 및 세마포어 초기화
+    # 설정값 읽기 및 기본값 적용
+    global _prefetch_token_bucket, _prefetch_semaphore # 전역 변수
     try:
+        # 초당 5토큰
         rate = int(config._config.get('prefetch_rate_per_sec', 5))
     except Exception:
         rate = 5
     try:
+        # 용량은 rate와 같게
         capacity = int(config._config.get('prefetch_rate_capacity', max(1, rate)))
     except Exception:
         capacity = max(1, rate)
     try:
+        # 동시 3개
         max_concurrent = int(config._config.get('prefetch_max_concurrent', 3))
     except Exception:
         max_concurrent = 3
     try:
+        # 토큰 버킷 및 세마포어 초기화
         _prefetch_token_bucket = TokenBucket(rate=float(rate), capacity=float(capacity))
         _prefetch_semaphore = threading.BoundedSemaphore(max_concurrent)
         log.info(f'Prefetch rate limiter initialized: rate={rate}/s, capacity={capacity}, max_concurrent={max_concurrent}')
@@ -369,7 +401,9 @@ def start_prefetch_scheduler(interval: int = 30):
     _prefetch_thread = threading.Thread(target=_prefetch_loop, args=(interval,), daemon=True)
     _prefetch_thread.start()
 
-
+# 스케쥴러 중지 함수
+# 스케쥴러 스레드 종료 대기 (최대 2초)
+# 기본값 30초
 def stop_prefetch_scheduler():
     global _prefetch_thread, _prefetch_stop
     _prefetch_stop.set()
@@ -378,12 +412,12 @@ def stop_prefetch_scheduler():
     _prefetch_thread = None
 
 
-@app.get("/health")
+@app.get("/health") # 헬스체크 엔드포인트
 def health():
     return {"status": "ok"}
 
 
-@app.get('/debug/status')
+@app.get('/debug/status') # 디버그 상태 엔드포인트
 def debug_status():
     """Return diagnostic info: pyupbit presence, redis connection, prefetch thread state, universe size."""
     try:
@@ -419,13 +453,13 @@ def debug_status():
     }
 
 
-@app.get("/config")
+@app.get("/config") # 설정 조회 엔드포인트
 def get_config():
     cfg = config._config
     return {"config": cfg}
 
 
-@app.post("/config")
+@app.post("/config") # 설정 저장 엔드포인트
 def post_config(payload: ConfigPayload):
     new_cfg = payload.config
     # 기본적인 검증: 반드시 strategy_name과 market이 있어야 함
@@ -441,58 +475,87 @@ def post_config(payload: ConfigPayload):
     return {"status": "saved"}
 
 
-@app.post("/reload")
+@app.post("/reload") # 설정 재로딩 엔드포인트
 def reload_config():
     config.reload_config()
     return {"status": "reloaded"}
 
 
 # --- Screening endpoints ---
-@app.get("/screen/volatility_top")
+# 변동성 상위 N개 티커 조회
+# market_prefix: 마켓 접두사 (기본값 "KRW")
+# top_n: 상위 N개 (기본값 10)
+# timeframe: 변동성 계산에 사용할 시간대 (기본값 "minute15")
+# 반환값: 변동성 상위 N개 티커 리스트
+# 변동성 계산은 (최고가 - 최저가) / 평균 종가 방식 사용
+# Upbit의 공용 kline 엔드포인트 사용
+# config.json의 'universe' 키에 티커 리스트가 없으면 기본 샘플 리스트 사용, 폴백 처리
+# 반환값: {"top": [ {"ticker": 티커명, "volatility": 변동성}, ... ] }
+# 캐시 사용으로 중복 Upbit 호출 최소화
+# 캐시 TTL은 _KLINES_CACHE_TTL 사용
+# 예외 발생 시 해당 티커는 건너뜀
+@app.get("/screen/volatility_top") # 변동성 상위 티커 조회 엔드포인트
 def volatility_top(market_prefix: str = "KRW", top_n: int = 10, timeframe: str = "minute15"):
-    """Return top N tickers by volatility over the last timeframe. Uses public kline endpoint for multiple markets.
-    Note: Upbit does not provide a single endpoint for all tickers' klines, so this endpoint expects the runtime/config.json to
-    include a list of tickers to check under 'universe' key or will fallback to a small default list."""
-    cfg = config._config
-    universe = cfg.get('universe', [])
+    cfg = config._config # 설정 읽기
+    universe = cfg.get('universe', []) # 유니버스 읽기
     if not universe:
-        # fallback sample universe
+        # 폴백: 기본 샘플 유니버스
         universe = [f"{market_prefix}-BTC", f"{market_prefix}-ETH", f"{market_prefix}-XRP", f"{market_prefix}-ADA", f"{market_prefix}-DOGE", f"{market_prefix}-SOL", f"{market_prefix}-DOT", f"{market_prefix}-MATIC", f"{market_prefix}-BCH", f"{market_prefix}-LTC"]
 
     results = []
     # Try to use internal cache to avoid hammering Upbit when checking multiple tickers
     now = time.time()
     for ticker in universe:
+        # 캐시 키 생성 (가장 최근 15캔들 기준)
         key = f"{ticker}|{timeframe}|15"
+        # 캐시 조회
         cached = _cache_get(key)
-        if cached and (now - cached[0]) < _KLINES_CACHE_TTL:
-            klines = cached[1]
+        # 캐시 유효성 검사
+        if cached and (now - cached[0]) < _KLINES_CACHE_TTL: # 캐시 유효 시
+            klines = cached[1] # 캐시된 값 사용
         else:
             try:
+                # Upbit에서 변동성 계산용 klines 조회 (rate-limited)
+                # 15캔들 기준 (폴백 200캔들 아님)
                 klines = _rate_limited_get_klines(ticker, timeframe, count=15)
             except Exception as e:
                 log.warning(f'Rate-limited fetch failed for {ticker}: {e}')
                 klines = None
-            # cache response even if None to avoid repeated failures
+            # 캐시 설정, None도 캐시하여 반복 실패 방지
             _cache_set(key, klines, ttl=_KLINES_CACHE_TTL)
         if not klines:
             continue
         highs = [float(k['high_price']) for k in klines]
         lows = [float(k['low_price']) for k in klines]
         closes = [float(k['trade_price']) for k in klines]
-        # volatility measure: stddev of returns or (max-min)/mean
+        # 변동성 계산 : (최고가 - 최저가) / 평균 종가 방식
         try:
             vol = (max(highs) - min(lows)) / (sum(closes) / len(closes))
         except Exception:
             vol = 0
         results.append({'ticker': ticker, 'volatility': vol})
 
+    # 변동성 기준 내림차순 정렬 후 상위 N개 반환
     results_sorted = sorted(results, key=lambda x: x['volatility'], reverse=True)[:top_n]
     return {"top": results_sorted}
 
 
 # --- Background Event Watcher ---
-
+# 단순 폴링 기반 워처 구현
+# 워처는 별도 스레드에서 동작하며, 지정된 마켓의 klines를 주기적으로 조회
+# 지정된 조건에 부합하는 이벤트 발생 시 로그 출력
+# 조건은 JSON 배열로 전달되며, 각 조건은 다음과 같은 형태를 가짐
+# {"type": "volatility_breakout", "k": 0.5} : 변동성 돌파 이벤트 (Larry Williams 스타일)
+# {"type": "volume_spike", "multiplier": 3} : 거래량 급증 이벤트
+# 워처 시작 엔드포인트
+# 요청 본문 예시:
+# {"market": "KRW-BTC",
+# "interval": 1,
+# "callbacks":[
+#     {"type":"volatility_breakout", "k":0.5},
+#     {"type":"volume_spike", "multiplier":3}
+# ]}
+# 워처 중지 엔드포인트
 def _watcher_loop(stop_event, market: str, check_interval: float, callbacks: List[dict]):
     """Simple polling watcher that fetches latest klines and invokes callbacks when conditions met."""
     log.info(f"Starting watcher loop for {market} (interval {check_interval}s)")
@@ -500,22 +563,24 @@ def _watcher_loop(stop_event, market: str, check_interval: float, callbacks: Lis
     while not stop_event.is_set():
         try:
             try:
+                # Upbit에서 최신 60캔들 조회 (rate-limited)
                 klines = _rate_limited_get_klines(market, 'minute1', count=60)
             except Exception as e:
                 log.error(f'Watcher fetch rate-limited or failed for {market}: {e}')
                 klines = None
 
+            # 이벤트 체크
             if klines:
-                # latest candle
+                # 최근 캔들
                 latest = klines[0]
-                # prepare a small window for volatility check (last 15 candles)
+                # 변동성 체크용 15캔들 윈도우 준비
                 window = klines[:15]
                 highs = [float(k['high_price']) for k in window]
                 lows = [float(k['low_price']) for k in window]
                 volumes = [float(k['candle_acc_trade_volume']) for k in window]
                 closes = [float(k['trade_price']) for k in window]
 
-                # Volatility breakout check (Larry Williams style simplified)
+                # 변동성 돌파 체크 (간단화된 Larry Williams 스타일)
                 try:
                     prev_close = closes[1]
                     curr_close = closes[0]
@@ -523,17 +588,20 @@ def _watcher_loop(stop_event, market: str, check_interval: float, callbacks: Lis
                 except Exception:
                     prev_close = curr_close = volatility_range = None
 
-                if prev_close is not None and curr_close is not None:
+                # 콜백 조건 체크
+                if prev_close is not None and curr_close is not None: # 유효한 데이터 시
+                    # 각 콜백 조건별 체크
                     for cb in callbacks:
                         if cb.get('type') == 'volatility_breakout':
-                            k = cb.get('k', 0.5)
+                            k = cb.get('k', 0.5) # 기본 k=0.5
                             # when current close > prev_close + range * k
                             if curr_close > (prev_close + volatility_range * k):
                                 log.info(f"Watcher detected volatility breakout on {market} (k={k})")
                         elif cb.get('type') == 'volume_spike':
-                            multiplier = cb.get('multiplier', 3)
+                            multiplier = cb.get('multiplier', 3) # 기본 multiplier=3
+                            # 평균 거래량 대비 현재 거래량이 multiplier 배 이상인 경우
                             avg_vol = sum(volumes[1:]) / (len(volumes)-1) if len(volumes) > 1 else 0
-                            if avg_vol and volumes[0] > avg_vol * multiplier:
+                            if avg_vol and volumes[0] > avg_vol * multiplier: # 거래량 급증 감지
                                 log.info(f"Watcher detected volume spike on {market} (x{multiplier})")
 
             time.sleep(check_interval)
@@ -542,28 +610,38 @@ def _watcher_loop(stop_event, market: str, check_interval: float, callbacks: Lis
             time.sleep(check_interval)
     log.info("Watcher loop stopped.")
 
-
-@app.post("/watcher/start")
+# 워처 시작 엔드포인트
+# 요청 본문 예시:
+# {"market": "KRW-BTC",
+# "interval": 1,
+# "callbacks":[
+#     {"type":"volatility_breakout", "k":0.5},
+#     {"type":"volume_spike", "multiplier":3}
+# ]}
+@app.post("/watcher/start") # 워처 시작 엔드포인트
 def start_watcher(payload: Dict[str, Any]):
-    """Start background watcher with simple JSON payload:
-    {"market": "KRW-BTC", "interval": 1, "callbacks":[{"type":"volatility_breakout", "k":0.5}, {"type":"volume_spike", "multiplier":3}]}
-    """
     if _watcher['running']:
         raise HTTPException(status_code=400, detail="Watcher already running")
 
-    market = payload.get('market', config.MARKET)
-    interval = float(payload.get('interval', 1.0))
-    callbacks = payload.get('callbacks', [])
+    # 파라미터 추출
+    market = payload.get('market', config.MARKET)   # 마켓 (기본값 config.MARKET)
+    interval = float(payload.get('interval', 1.0))  # 체크 간격 (초)
+    callbacks = payload.get('callbacks', [])        # 콜백 조건 리스트
 
+    # 워처 스레드 시작
     stop_event = threading.Event()
+    # 워처 루프 스레드 생성 및 시작
     t = threading.Thread(target=_watcher_loop, args=(stop_event, market, interval, callbacks), daemon=True)
-    _watcher['running'] = True
-    _watcher['thread'] = t
-    _watcher['stop_event'] = stop_event
+    _watcher['running'] = True              # 워처 상태 갱신
+    _watcher['thread'] = t                  # 워처 스레드 저장
+    _watcher['stop_event'] = stop_event     # 중지 이벤트 저장
     t.start()
     return {"status": "started"}
 
-
+# 워처 중지 엔드포인트
+# 워처 중지 이벤트 설정 및 스레드 종료 대기
+# 워처 상태 초기화
+# 반환값: {"status": "stopped"} 또는 {"status": "not_running"}
 @app.post("/watcher/stop")
 def stop_watcher():
     if not _watcher['running']:
@@ -575,13 +653,19 @@ def stop_watcher():
     _watcher['stop_event'] = None
     return {"status": "stopped"}
 
-
+# 배치 klines 조회 엔드포인트
+# 티커/타임프레임/카운트 조합별로 캐시 키 생성 (인메모리 또는 Redis)
+# 요청 본문 예시:
+# {"tickers": ["KRW-BTC","KRW-ETH"], "timeframe":"minute15", "count":100}
+# 반환값 예시:
+# {"klines": {"KRW-BTC": [...], "KRW-ETH": [...]} }
+# 각 티커별로 klines를 조회하여 결과 딕셔너리에 저장
+# 내부적으로 캐시를 사용하여 중복 Upbit 호출 최소화
+# 캐시 TTL은 _KLINES_CACHE_TTL 사용
+# 캐시 미스 시 rate-limited fetcher를 사용하여 Upbit에서 klines 조회
+# 예외 발생 시 해당 티커는 None으로 설정
 @app.post('/klines_batch')
 def klines_batch(payload: KlinesBatchRequest):
-    """Return klines for multiple tickers in a single request. Uses in-memory cache per ticker/timeframe/count key.
-    Request body: {"tickers": ["KRW-BTC","KRW-ETH"], "timeframe":"minute15", "count":100}
-    Response: {"klines": {"KRW-BTC": [...], ...}}
-    """
     req = payload.model_dump()
     tickers = req.get('tickers', []) or []
     timeframe = req.get('timeframe', 'minute15')
@@ -590,66 +674,85 @@ def klines_batch(payload: KlinesBatchRequest):
     result = {}
     now = time.time()
     for ticker in tickers:
-        key = f"{ticker}|{timeframe}|{count}"
+        key = f"{ticker}|{timeframe}|{count}" # 캐시 키 생성
         cached = _cache_get(key)
+        # 캐시 유효성 검사
+        # 캐시 유효 시 캐시된 값 사용
         if cached and (now - cached[0]) < _KLINES_CACHE_TTL:
             result[ticker] = cached[1]
             continue
 
-        # Attempt to find a cached entry with a larger count and slice it (supports both Redis and in-memory)
+        # 카운트 이상인 캐시 항목 검색 시도 (인메모리 및 Redis 모두 지원)
+        # 가장 큰 count를 가진 항목 선택
+        # 캐시 미스 시 rate-limited fetcher 사용
         klines = None
         try:
-            # search in Redis first if available
+            # 가능한 경우 Redis에서 검색
             if _redis_client:
                 try:
                     pattern = f"{ticker}|{timeframe}|*"
+                    # 패턴 매칭 키 조회
                     keys = _redis_client.keys(pattern)
-                    # find candidate with largest count >= requested
+                    # 후보 탐색 및 선택 (요청보다 가장 큰 count)
                     best = None
                     best_cnt = 0
                     for k in keys:
                         try:
+                            # 키 파싱 [ticker, timeframe, count]
                             parts = k.split('|')
+
+                            # 유효한 키 형식 시 (3개 이상 파트로 구성)
                             if len(parts) >= 3:
+                                # count 부분 (마지막 부분)
                                 kcnt = int(parts[-1])
+                                # 요청보다 크고 현재 최상위 후보보다 큰 경우
                                 if kcnt >= count and kcnt > best_cnt:
-                                    best = k
-                                    best_cnt = kcnt
+                                    best = k        # 후보 키 갱신
+                                    best_cnt = kcnt # 후보 카운트 갱신
                         except Exception:
                             continue
+                    # 후보 키가 발견된 경우
                     if best:
+                        # 후보 키로 캐시 조회
                         cached2 = _cache_get(best, ttl=_KLINES_CACHE_TTL)
+                        # 후보 캐시에서 klines 추출
                         if cached2:
                             klines_full = cached2[1]
+                            # 유효한 klines 시
                             if isinstance(klines_full, list) and len(klines_full) > 0:
-                                # return last `count` elements (most recent)
+                                # 요청한 개수만큼 슬라이싱하여 반환
                                 klines = klines_full[-count:]
                 except Exception:
                     pass
             else:
-                # in-memory search
+                # 인-메모리 캐시에서 후보 탐색
                 try:
                     candidates = []
+                    # 인-메모리 캐시 순회
                     for k, v in list(_klines_cache.items()):
                         try:
+                            # 키 파싱 [ticker, timeframe, count]
                             parts = k.split('|')
+                            # 유효한 키 형식 시 (3개 이상 파트로 구성)
                             if parts[0] == ticker and parts[1] == timeframe:
-                                kcnt = int(parts[2])
-                                candidates.append((kcnt, v))
+                                kcnt = int(parts[2])            # count 부분
+                                candidates.append((kcnt, v))    # 후보 리스트에 추가
                         except Exception:
                             continue
-                    # pick candidate with largest count >= requested
-                    candidates = sorted(candidates, key=lambda x: x[0], reverse=True)
+                    # 후보 정렬 및 선택 (요청보다 큰 count)
+                    candidates = sorted(candidates, key=lambda x: x[0], reverse=True) # 내림차순 정렬
                     for kcnt, v in candidates:
                         if kcnt >= count:
                             klines_full = v[1]
+                            # 유효한 klines 시
                             if isinstance(klines_full, list) and len(klines_full) > 0:
+                                # 요청한 개수만큼 슬라이싱하여 반환
                                 klines = klines_full[-count:]
                                 break
                 except Exception:
                     pass
 
-            # If still not found, perform a rate-limited fetch
+            # 캐시에서 발견되지 않은 경우 rate-limited fetcher 사용
             if klines is None:
                 try:
                     klines = _rate_limited_get_klines(ticker, timeframe, count=count)
@@ -660,8 +763,201 @@ def klines_batch(payload: KlinesBatchRequest):
             log.warning(f'klines_batch lookup error for {ticker}: {e}')
             klines = None
 
-        # cache result (even if None) to prevent hammering
+        # 캐시 설정 (실패 시에도 캐시하여 반복 실패 방지)
         _cache_set(key, klines, ttl=_KLINES_CACHE_TTL)
         result[ticker] = klines
 
     return {'klines': result}
+
+@app.get('/balances')
+def get_balances():
+    """Return account balances from Upbit using private API keys.
+    If no keys are configured, return 503 with informative message.
+    This endpoint will cache the balances for a short TTL (_BALANCES_CACHE_TTL) to reduce repeated Upbit calls.
+    Response includes extra diagnostic fields:
+      - balances: raw balances list (as returned by Upbit)
+      - reported_krw_balance: numeric KRW balance as reported in balances (0 if none)
+      - cached: whether the response came from server cache
+      - cached_ts: timestamp when cached
+    """
+    if _upbit_private is None:
+        raise HTTPException(status_code=503, detail='Upbit API keys not configured on server; balances unavailable')
+
+    cache_key = 'upbit:balances:all'
+    now = time.time()
+    # Try cache first
+    cached = _cache_get(cache_key, ttl=_BALANCES_CACHE_TTL)
+    if cached and (now - cached[0]) < _BALANCES_CACHE_TTL:
+        bl = cached[1]
+        cached_flag = True
+        cached_ts = cached[0]
+        log.debug('Balances: cache hit')
+    else:
+        cached_flag = False
+        cached_ts = None
+        try:
+            bl = _upbit_private.get_balances()
+        except Exception as e:
+            log.error(f'Balances retrieval failed: {e}')
+            # if cache exists return cached even if stale (best-effort)
+            if cached:
+                bl = cached[1]
+                cached_flag = True
+                cached_ts = cached[0]
+            else:
+                raise HTTPException(status_code=502, detail=f'Upbit API call failed: {e}')
+        # store even None to avoid repeated bad calls
+        _cache_set(cache_key, bl, ttl=_BALANCES_CACHE_TTL)
+
+    # compute reported KRW balance from returned balances
+    reported_krw = 0.0
+    try:
+        if isinstance(bl, list):
+            for item in bl:
+                # Upbit /v1/accounts returns items with 'currency' and 'balance'
+                try:
+                    cur = str(item.get('currency') or item.get('unit') or '').upper()
+                    bal = float(item.get('balance') or 0.0)
+                except Exception:
+                    continue
+                if cur == 'KRW' or cur.startswith('KRW'):
+                    reported_krw += bal
+        elif isinstance(bl, dict):
+            # sometimes a dict wrapper
+            lst = bl.get('balances') if 'balances' in bl else None
+            if isinstance(lst, list):
+                for item in lst:
+                    try:
+                        cur = str(item.get('currency') or item.get('unit') or '').upper()
+                        bal = float(item.get('balance') or 0.0)
+                    except Exception:
+                        continue
+                    if cur == 'KRW' or cur.startswith('KRW'):
+                        reported_krw += bal
+    except Exception:
+        reported_krw = 0.0
+
+    return {
+        'balances': bl,
+        'reported_krw_balance': reported_krw,
+        'cached': bool(cached_flag),
+        'cached_ts': cached_ts,
+    }
+
+@app.get("/positions")
+def get_positions():
+    """Return account positions computed from Upbit balances and current prices.
+
+    Uses the private API to fetch account balances and the public API to fetch
+    latest prices (rate-limited). Returns JSON with per-asset position info and
+    summary totals.
+    """
+    if _upbit_private is None:
+        raise HTTPException(status_code=503, detail='Upbit API keys not configured on server; positions unavailable')
+
+    try:
+        bl = _upbit_private.get_balances() or []
+    except Exception as e:
+        log.error(f'Failed to retrieve balances for positions endpoint: {e}')
+        raise HTTPException(status_code=502, detail=f'Failed to retrieve balances: {e}')
+
+    positions = []
+    total_equity = 0.0
+    available_krw = 0.0
+
+    # Build list of markets to query for price
+    markets = []
+    currency_map = {}
+    try:
+        for item in bl:
+            cur = str(item.get('currency') or item.get('unit') or '').upper()
+            bal = float(item.get('balance') or 0) if item is not None else 0.0
+            locked = float(item.get('locked') or 0) if item is not None else 0.0
+            # KRW cash handling
+            if cur == 'KRW' or cur.startswith('KRW'):
+                available_krw += bal
+                total_equity += bal
+                continue
+            size = bal + locked
+            if size <= 0:
+                continue
+            market = f'KRW-{cur}'
+            markets.append(market)
+            currency_map[market] = {
+                'currency': cur,
+                'size': size,
+                'avg_buy_price': float(item.get('avg_buy_price') or 0)
+            }
+    except Exception as e:
+        log.warning(f'Error while parsing balances for positions: {e}')
+
+    # Fetch current prices (1 candle minute1, count=1) for each market (rate-limited)
+    price_map = {}
+    for m in set(markets):
+        try:
+            kl = None
+            try:
+                kl = _rate_limited_get_klines(m, 'minute1', count=1)
+            except Exception as e:
+                log.warning(f'Price fetch failed for {m}: {e}')
+                kl = None
+            price = None
+            if kl and isinstance(kl, list) and len(kl) > 0:
+                try:
+                    first = kl[0]
+                    price_candidate = None
+                    # support dict-like records
+                    if isinstance(first, dict):
+                        price_candidate = first.get('trade_price') or first.get('close')
+                    else:
+                        # try attribute access (some wrappers may expose .close or .trade_price)
+                        price_candidate = getattr(first, 'trade_price', None) or getattr(first, 'close', None)
+                    if price_candidate is None:
+                        price = None
+                    else:
+                        price = float(price_candidate)
+                except Exception:
+                    price = None
+            price_map[m] = price
+        except Exception as e:
+             log.warning(f'Unexpected error fetching price for {m}: {e}')
+             price_map[m] = None
+
+    # Build positions with computed PnL and notional
+    excluded_assets = []
+    for market, meta in currency_map.items():
+        cur = meta['currency']
+        size = float(meta['size'])
+        avg_price = float(meta.get('avg_buy_price') or 0.0)
+        current_price = price_map.get(market)
+
+        # Skip assets without a current price (user requested) and report them
+        if current_price is None:
+            excluded_assets.append({'symbol': market, 'reason': 'no_price'})
+            continue
+
+        notional = size * float(current_price)
+        total_equity += notional
+        unrealized = None
+        if avg_price and avg_price > 0:
+            unrealized = (float(current_price) - avg_price) * size
+
+        pos = {
+            'symbol': market,
+            'side': 'LONG',
+            'size': size,
+            'entry_price': avg_price if avg_price > 0 else None,
+            'current_price': current_price,
+            'unrealized_pnl': unrealized,
+            'notional_krw': notional,
+        }
+        positions.append(pos)
+
+    # Also include list of excluded assets so UI can show a friendly message.
+    return {
+        'positions': positions,
+        'total_equity_krw': total_equity,
+        'available_krw': available_krw,
+        'prices_fetched': len([p for p in price_map.values() if p is not None]),
+        'excluded_assets': excluded_assets,
+    }

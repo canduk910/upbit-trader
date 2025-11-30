@@ -19,9 +19,7 @@ UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-
 # --- 2. runtime/config.json 파일에서 설정 파라미터 로드 ---
-
 def _get_runtime_config_path():
     project_root = os.path.dirname(os.path.dirname(__file__))
     return os.path.join(project_root, 'runtime', 'config.json')
