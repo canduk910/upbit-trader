@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build backend image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile.backend
+          push: false
+          tags: upbit-trader-backend:ci
+
+      - name: Build ui image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile.ui
+          push: false
+          tags: upbit-trader-ui:ci
+
+      - name: Build bot image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile.bot
+          push: false
+          tags: upbit-trader-bot:ci
+
+      - name: Create docker network
+        run: |
+          docker network create ci-network || true
+
+      - name: Start Redis container
+        run: |
+          docker run -d --name ci-redis --network ci-network -p 6379:6379 redis:7-alpine
+
+      - name: Run backend container (CI)
+        run: |
+          docker run -d \
+            --name ci-backend \
+            --network ci-network \
+            -e REDIS_URL=redis://ci-redis:6379 \
+            -p 8000:8000 \
+            upbit-trader-backend:ci
+
+      - name: Wait for backend health
+        run: |
+          for i in {1..30}; do
+            if curl -sS http://localhost:8000/health >/dev/null 2>&1; then
+              echo 'backend healthy'
+              exit 0
+            fi
+            sleep 2
+          done
+          echo 'backend did not become healthy' >&2
+          docker logs ci-backend || true
+          exit 1
+
+      - name: Run minimal smoke tests
+        run: |
+          curl -sS http://localhost:8000/health
+
+      - name: Cleanup
+        run: |
+          docker rm -f ci-backend ci-redis || true
+          docker network rm ci-network || true

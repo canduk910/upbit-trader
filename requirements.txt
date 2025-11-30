@@ -6,6 +6,9 @@ pyjwt
 pandas
 ta
 
+# 시각화
+plotly
+
 # AI (LLM) 연동
 openai
 google-generativeai
@@ -19,3 +22,9 @@ uvicorn
 
 # Streamlit UI
 streamlit
+
+# Redis client for caching
+redis
+
+# Upbit python client
+pyupbit

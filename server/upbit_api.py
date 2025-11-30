@@ -4,7 +4,23 @@ import hashlib
 from urllib.parse import urlencode
 import requests
 import time
-from logger import log
+from server.logger import log
+try:
+    import pyupbit
+    _HAS_PYUPBIT = True
+except Exception:
+    pyupbit = None
+    _HAS_PYUPBIT = False
+
+# pandas and pytz may be available via pyupbit dependencies; import safely
+try:
+    import pandas as pd
+    import pytz
+    _HAS_PANDAS = True
+except Exception:
+    pd = None
+    pytz = None
+    _HAS_PANDAS = False
 
 
 class UpbitAPI:
@@ -13,15 +29,18 @@ class UpbitAPI:
     JWT 인증 및 주요 API 호출 기능
     """
 
-    def __init__(self, access_key, secret_key):
+    def __init__(self, access_key=None, secret_key=None):
         self.access_key = access_key
         self.secret_key = secret_key
         self.server_url = "https://api.upbit.com"
 
     def _generate_auth_token(self, query_params=None):
         """
-        API 요청을 위한 JWT 인증 토큰 생성
+        API 요청을 위한 JWT 인증 토큰 생성 (키가 없으면 None 반환)
         """
+        if not self.access_key or not self.secret_key:
+            return None
+
         payload = {
             'access_key': self.access_key,
             'nonce': str(uuid.uuid4()),
@@ -47,51 +66,82 @@ class UpbitAPI:
         """
         url = self.server_url + endpoint
 
-        # 쿼리 파라미터 설정 (GET, DELETE 요청 시)
-        query = None
-        if method in ['GET', 'DELETE'] and params:
-            query = params
+        # 바디 및 쿼리 설정
+        query = params if method in ['GET', 'DELETE'] else None
+        body = data if method in ['POST', 'PUT'] else None
 
-        # 바디 파라미터 설정 (POST, PUT 요청 시)
-        body = None
-        if method in ['POST', 'PUT'] and data:
-            body = data
-
-        # GET/DELETE는 query를, POST/PUT은 body를 기준으로 토큰 생성
         auth_token = self._generate_auth_token(query or body)
 
         if headers is None:
             headers = {}
-        headers['Authorization'] = auth_token
+        if auth_token:
+            headers['Authorization'] = auth_token
 
-        try:
-            if method == 'GET':
-                response = requests.get(url, headers=headers, params=params)
-            elif method == 'POST':
-                headers['Content-Type'] = 'application/json'
-                response = requests.post(url, headers=headers, json=data)
-            elif method == 'DELETE':
-                response = requests.delete(url, headers=headers, params=params)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
+        # Implement retry on 429 and some transient network errors
+        max_retries = 5
+        backoff_base = 0.5
+        last_exc = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                if method == 'GET':
+                    response = requests.get(url, headers=headers, params=params, timeout=10)
+                elif method == 'POST':
+                    headers['Content-Type'] = 'application/json'
+                    response = requests.post(url, headers=headers, json=data, timeout=10)
+                elif method == 'DELETE':
+                    response = requests.delete(url, headers=headers, params=params, timeout=10)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
 
-            # API 속도 제한 (초당 10회, 분당 600회) - 간단한 딜레이
-            time.sleep(0.15)  # 150ms 대기 (초당 약 6.6회)
+                # If rate-limited, backoff and retry
+                if response.status_code == 429:
+                    wait = backoff_base * (2 ** (attempt - 1))
+                    jitter = random.uniform(0, 0.5)
+                    total_wait = wait + jitter
+                    log.warning(f'Upbit API rate limit hit (429). retry {attempt}/{max_retries} after {total_wait:.2f}s')
+                    time.sleep(total_wait)
+                    last_exc = requests.exceptions.HTTPError('429 Too Many Requests')
+                    continue
 
-            response.raise_for_status()  # 4xx, 5xx 에러 발생 시 예외 처리
-            return response.json()
+                response.raise_for_status()
+                # small pause to avoid tight loops
+                time.sleep(0.12)
+                return response.json()
+            except requests.exceptions.HTTPError as http_err:
+                last_exc = http_err
+                status = getattr(getattr(http_err, 'response', None), 'status_code', None)
+                # if not rate-limited, don't retry further
+                if status != 429:
+                    txt = getattr(http_err, 'response', None)
+                    extra = ''
+                    try:
+                        if txt is not None:
+                            extra = f" - {txt.text}"
+                    except Exception:
+                        extra = ''
+                    log.error(f"HTTP error occurred: {http_err}{extra}")
+                    break
+                # else loop will retry
+            except requests.exceptions.RequestException as req_e:
+                last_exc = req_e
+                # transient network error -> backoff and retry
+                wait = backoff_base * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                log.warning(f'Network error during Upbit API call: {req_e}. retry {attempt}/{max_retries} after {wait:.2f}s')
+                time.sleep(wait)
+                continue
+            except Exception as e:
+                last_exc = e
+                log.error(f"An error occurred: {e}")
+                break
 
-        except requests.exceptions.HTTPError as http_err:
-            log.error(f"HTTP error occurred: {http_err} - {response.text}")
-        except Exception as e:
-            log.error(f"An error occurred: {e}")
+        # Retries exhausted or non-retryable error
         return None
 
     # --- Public API Methods ---
 
     def get_balances(self):
         """
-        전체 계좌 잔고 조회
+        전체 계좌 잔고 조회 (인증 필요)
         """
         endpoint = "/v1/accounts"
         return self._send_request('GET', endpoint)
@@ -99,82 +149,83 @@ class UpbitAPI:
     def get_balance(self, ticker="KRW"):
         """
         특정 화폐/코인의 잔고 조회
-        :param ticker: 'KRW', 'BTC', 'ETH' 등
-        :return: (float) 사용 가능한 잔고
         """
         balances = self.get_balances()
         if balances:
             for b in balances:
-                if b['currency'] == ticker:
-                    return float(b['balance'])
+                if b.get('currency') == ticker:
+                    try:
+                        return float(b.get('balance', 0))
+                    except Exception:
+                        return 0.0
         return 0.0
 
     def get_klines(self, market, timeframe="minute1", count=200):
         """
-        캔들(시세) 조회
-        :param market: 마켓 코드 (예: KRW-BTC)
-        :param timeframe: 캔들 단위 (예: minute1, minute5, day)
-        :param count: 조회할 캔들 수 (최대 200)
+        캔들(시세) 조회: timeframe 문자열을 Upbit 엔드포인트로 매핑하여 호출합니다.
+        지원 예: 'minute1', 'minute3', 'minute5', 'minute15', 'minute60', 'day'
         """
-        endpoint = f"/v1/candles/{timeframe}"
-        params = {
-            "market": market,
-            "count": count
-        }
-        # 업비트 캔들은 오래된 순 -> 최신 순으로 정렬되어 반환됨
-        return self._send_request('GET', endpoint, params=params)
-
-    def place_order(self, market, side, ord_type, volume=None, price=None):
-        """
-        주문 실행
-        :param market: 마켓 코드 (예: KRW-BTC)
-        :param side: 'bid' (매수), 'ask' (매도)
-        :param ord_type: 'limit' (지정가), 'price' (시장가 매수), 'market' (시장가 매도)
-        :param volume: (지정가, 시장가 매도 시) 주문 수량
-        :param price: (지정가, 시장가 매수 시) 주문 가격 또는 주문 총액(KRW)
-        """
-        endpoint = "/v1/orders"
-        data = {
-            "market": market,
-            "side": side,
-            "ord_type": ord_type,
-        }
-
-        if ord_type == 'limit':
-            if volume is None or price is None:
-                raise ValueError("limit order requires 'volume' and 'price'")
-            data['volume'] = str(volume)
-            data['price'] = str(price)
-
-        elif ord_type == 'price':  # 시장가 매수 (KRW 기준)
-            if side != 'bid' or price is None:
-                raise ValueError("market buy (price) order requires 'side=bid' and 'price' (total KRW)")
-            data['price'] = str(price)
-
-        elif ord_type == 'market':  # 시장가 매도 (코인 수량 기준)
-            if side != 'ask' or volume is None:
-                raise ValueError("market sell (market) order requires 'side=ask' and 'volume' (coin amount)")
-            data['volume'] = str(volume)
+        # 매핑
+        tf = timeframe.lower()
+        if tf.startswith('minute'):
+            # minuteN -> /v1/candles/minutes/N
+            try:
+                n = int(tf.replace('minute', ''))
+                endpoint = f"/v1/candles/minutes/{n}"
+            except Exception:
+                endpoint = "/v1/candles/minutes/1"
+        elif tf in ('day', 'days'):
+            endpoint = "/v1/candles/days"
+        elif tf in ('week', 'weeks'):
+            endpoint = "/v1/candles/weeks"
+        elif tf in ('month', 'months'):
+            endpoint = "/v1/candles/months"
         else:
-            raise ValueError(f"Invalid ord_type: {ord_type}")
+            # fallback
+            endpoint = f"/v1/candles/{tf}"
 
-        log.info(f"Placing order: {data}")
-        return self._send_request('POST', endpoint, data=data)
-
-    def get_order_status(self, uuid):
-        """
-        개별 주문 상태 조회
-        :param uuid: 주문 UUID
-        """
-        endpoint = "/v1/order"
-        params = {"uuid": uuid}
-        return self._send_request('GET', endpoint, params=params)
-
-    def cancel_order(self, uuid):
-        """
-        주문 취소
-        :param uuid: 주문 UUID
-        """
-        endpoint = "/v1/order"
-        params = {"uuid": uuid}
-        return self._send_request('DELETE', endpoint, params=params)
+        # Try pyupbit if available for convenience and reliability
+        tf = timeframe.lower()
+        if _HAS_PYUPBIT:
+            try:
+                # pyupbit uses periods like "minute" string: use the numeric mapping
+                if tf.startswith('minute'):
+                    n = int(tf.replace('minute',''))
+                    interval_str = f"minute{n}"
+                    df = pyupbit.get_ohlcv(market, interval=interval_str, count=count)
+                elif tf in ('day','days'):
+                    df = pyupbit.get_ohlcv(market, interval='day', count=count)
+                elif tf in ('week','weeks'):
+                    df = pyupbit.get_ohlcv(market, interval='week', count=count)
+                elif tf in ('month','months'):
+                    df = pyupbit.get_ohlcv(market, interval='month', count=count)
+                else:
+                    # fallback to requests-based endpoint
+                    df = None
+                if df is not None:
+                    records = []
+                    # convert index to KST-aware ISO strings when possible
+                    for idx, row in df.iterrows():
+                        ts_str = None
+                        try:
+                            if _HAS_PANDAS and isinstance(idx, pd.Timestamp):
+                                # if naive, assume UTC and localize; then convert to Asia/Seoul
+                                if idx.tzinfo is None:
+                                    idx_utc = idx.tz_localize('UTC')
+                                else:
+                                    idx_utc = idx.tz_convert('UTC') if idx.tzinfo else idx.tz_localize('UTC')
+                                if pytz:
+                                    kst = pytz.timezone('Asia/Seoul')
+                                    idx_kst = idx_utc.tz_convert(kst)
+                                    ts_str = idx_kst.isoformat()
+                                else:
+                                    ts_str = idx_utc.isoformat()
+                            else:
+                                # fallback: str(idx)
+                                ts_str = str(idx)
+                        except Exception:
+                            ts_str = str(idx)
+                        records.append({'candle_date_time_kst': ts_str, 'opening_price': row['open'], 'high_price': row['high'], 'low_price': row['low'], 'trade_price': row['close'], 'candle_acc_trade_volume': row['volume']})
+                    return records
+            except Exception as e:
+                log.warning(f'pyupbit get_klines failed, falling back to HTTP: {e}')

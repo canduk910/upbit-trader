@@ -1,4 +1,4 @@
-from logger import log
+from server.logger import log
 
 
 class KellyCriterionManager:
@@ -47,4 +47,3 @@ class KellyCriterionManager:
         trade_amount = total_balance * self.kelly_fraction
         log.info(f"Calculated trade amount: {trade_amount:,.0f} KRW (Balance: {total_balance:,.0f} * Kelly: {self.kelly_fraction:.2%})")
         return trade_amount
-

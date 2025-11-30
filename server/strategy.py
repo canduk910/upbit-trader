@@ -1,6 +1,6 @@
 import pandas as pd
 import ta
-from logger import log
+from server.logger import log
 
 
 class Strategy:

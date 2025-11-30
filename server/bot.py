@@ -14,6 +14,10 @@ try:
 except Exception:
     EnsembleAnalyzer = None
 
+try:
+    import pyupbit
+except Exception:
+    pyupbit = None
 
 class TradingBot:
     def __init__(self):
@@ -148,22 +152,181 @@ class TradingBot:
         df = df.astype({'opening_price': float, 'high_price': float, 'low_price': float, 'trade_price': float,
                         'candle_acc_trade_volume': float})
         df = df.rename(
-            columns={'candle_date_time_kst': 'time', 'opening_price': 'open', 'high_price': 'high', 'low_price': 'low',
-                     'trade_price': 'close', 'candle_acc_trade_volume': 'volume'})
-        df = df.sort_index(ascending=True).reset_index(drop=True)
-
-        # 보조지표 추가 (AI 분석용)
-        df['rsi'] = ta.momentum.rsi(df['close'], window=14)
-        bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
+            columns={'candle_date_time_kst': 'time', 'opening_price': 'open', 'high_price': 'high',
+                     'low_price': 'low', 'trade_price': 'close', 'candle_acc_trade_volume': 'volume'})
+        df['rsi'] = ta.momentum.RSIIndicator(close=df['close'], window=14, fillna=True).rsi()
+        bb = ta.volatility.BollingerBands(close=df['close'], window=20, window_dev=2, fillna=True)
         df['bb_upper'] = bb.bollinger_hband()
         df['bb_lower'] = bb.bollinger_lband()
-        df['sma_20'] = ta.trend.sma_indicator(df['close'], window=20)
-        df['sma_60'] = ta.trend.sma_indicator(df['close'], window=60)
-        macd = ta.trend.MACD(df['close'])
+        df['sma_20'] = ta.trend.SMAIndicator(close=df['close'], window=20, fillna=True).sma_indicator()
+        df['sma_60'] = ta.trend.SMAIndicator(close=df['close'], window=60, fillna=True).sma_indicator()
+        macd = ta.trend.MACD(close=df['close'], window_slow=26, window_fast=12, window_sign=9, fillna=True)
         df['macd'] = macd.macd()
         df['macd_signal'] = macd.macd_signal()
-
         return df
+
+    def build_trading_context(self, klines):
+        """Upbit 시세/계좌 정보를 기반으로 TradingContext JSON(dict)를 구성한다."""
+        # 1) 기술지표용 DataFrame 생성 (기존 로직 재사용)
+        df = self.process_data_for_ai(klines)
+
+        if df is None or df.empty:
+            raise ValueError('No data for building TradingContext')
+
+        df = df.sort_values('time').reset_index(drop=True)
+        last_row = df.iloc[-1]
+        symbol = self.market  # 예: 'KRW-BTC'
+        quote, base = symbol.split('-')
+
+        # 일간 등락률/거래대금은 단일 타임프레임 기준의 근사값으로 계산
+        if len(df) > 1:
+            prev_close = float(df['close'].iloc[-2])
+            day_change_pct = float((last_row['close'] / prev_close - 1.0) * 100.0) if prev_close else 0.0
+        else:
+            day_change_pct = 0.0
+        day_volume_krw = float((df['close'] * df['volume']).sum())
+
+        # 2) 계좌/포지션 정보
+        total_equity_krw = 0.0
+        available_krw = 0.0
+        positions = []
+        this_position = None
+
+        try:
+            balances = self.api.get_balances() or []
+        except Exception as e:
+            log.warning(f'Failed to fetch balances for AI context: {e}')
+            balances = []
+
+        for b in balances:
+            currency = b.get('currency')
+            balance = float(b.get('balance', 0) or 0)
+            locked = float(b.get('locked', 0) or 0)
+            avg_buy_price = float(b.get('avg_buy_price', 0) or 0)
+
+            if currency == 'KRW':
+                available_krw = balance
+                total_equity_krw += balance
+                continue
+
+            # KRW 마켓 기준으로만 평가 (필요 시 BTC/USDT 마켓 확장 가능)
+            if balance <= 0 and locked <= 0:
+                continue
+
+            market_symbol = f'KRW-{currency}'
+            # 현재 심볼의 현재가는 df 기준 마지막 종가 사용
+            if market_symbol == symbol:
+                current_price = float(last_row['close'])
+            else:
+                current_price = avg_buy_price  # 다른 코인은 보수적으로 평단가 기준
+
+            notional = (balance + locked) * current_price
+            total_equity_krw += notional
+
+            pos = {
+                'symbol': market_symbol,
+                'side': 'LONG',
+                'size': balance + locked,
+                'entry_price': avg_buy_price,
+                'avg_price': avg_buy_price,
+                'unrealized_pnl': None,
+                'leverage': 1.0,
+                'notional_krw': notional,
+            }
+            positions.append(pos)
+
+            if market_symbol == symbol:
+                this_position = pos
+
+        # 3) 오더북 (pyupbit가 있을 때만 조회, 실패해도 무시)
+        orderbook = None
+        if 'pyupbit' in globals() and pyupbit is not None:
+            try:
+                ob_list = pyupbit.get_orderbook(tickers=symbol)
+                if ob_list:
+                    ob = ob_list[0]
+                    units = ob.get('orderbook_units', [])[:5]  # 상위 5호가까지만
+                    bids = [{'price': u['bid_price'], 'size': u['bid_size']} for u in units]
+                    asks = [{'price': u['ask_price'], 'size': u['ask_size']} for u in units]
+                    orderbook = {
+                        'timestamp': ob.get('timestamp'),
+                        'bids': bids,
+                        'asks': asks,
+                    }
+            except Exception as e:
+                log.warning(f'Failed to fetch orderbook for AI context: {e}')
+
+        # 4) 미체결 주문 (현재 UpbitAPI에 없으므로 일단 빈 리스트)
+        open_orders = []
+
+        # 5) 타임프레임 정보 구성 (현재는 self.timeframe 하나만 사용)
+        tf_key = self.timeframe
+        last_candle = {
+            'time': str(last_row['time']),
+            'open': float(last_row['open']),
+            'high': float(last_row['high']),
+            'low': float(last_row['low']),
+            'close': float(last_row['close']),
+            'volume': float(last_row['volume']),
+        }
+        indicators = {
+            'close': float(last_row['close']),
+            'rsi': float(last_row['rsi']) if not pd.isna(last_row['rsi']) else None,
+            'bb_upper': float(last_row['bb_upper']) if not pd.isna(last_row['bb_upper']) else None,
+            'bb_lower': float(last_row['bb_lower']) if not pd.isna(last_row['bb_lower']) else None,
+            'sma_20': float(last_row['sma_20']) if not pd.isna(last_row['sma_20']) else None,
+            'sma_60': float(last_row['sma_60']) if not pd.isna(last_row['sma_60']) else None,
+            'macd': float(last_row['macd']) if not pd.isna(last_row['macd']) else None,
+            'macd_signal': float(last_row['macd_signal']) if not pd.isna(last_row['macd_signal']) else None,
+            'recent_closes': df['close'].tail(60).tolist(),
+        }
+        timeframes = {
+            tf_key: {
+                'last_candle': last_candle,
+                'indicators': indicators,
+            }
+        }
+
+        trading_context = {
+            'meta': {
+                'exchange': 'UPBIT',
+                'market_type': 'SPOT',
+                'symbol': symbol,
+                'quote_currency': quote,
+                'generated_at_kst': str(last_row['time']),
+                'ai_hint': {
+                    'strategy': getattr(config, 'STRATEGY_NAME', 'UNKNOWN'),
+                    'loop_interval_sec': self.loop_interval,
+                },
+            },
+            'constraints': {
+                'min_order_krw': float(getattr(config, 'MIN_ORDER_AMOUNT', 5000)),
+                'per_trade_max_krw': float(self.trade_amount_krw),
+                'allow_short': False,
+                'use_leverage': False,
+            },
+            'account': {
+                'total_equity_krw': float(total_equity_krw),
+                'available_krw': float(available_krw),
+                'positions': positions,
+                'open_orders': open_orders,
+            },
+            'markets': [
+                {
+                    'symbol': symbol,
+                    'base': base,
+                    'quote': quote,
+                    'day_change_pct': day_change_pct,
+                    'day_volume_krw': day_volume_krw,
+                    'timeframes': timeframes,
+                    'orderbook': orderbook,
+                    'position': this_position,
+                }
+            ],
+        }
+
+        return trading_context
+
 
     def run(self):
         log.info("Bot main loop started. Monitoring market...")
@@ -188,11 +351,11 @@ class TradingBot:
 
                 if technical_signal == 'BUY' and not self.in_position:
                     log.info(f"🚀 Technical Signal [BUY] detected! Asking AI Ensemble for confirmation...")
-                    ai_df = self.process_data_for_ai(klines)
+                    trading_context = self.build_trading_context(klines)
                     ai_decision = None
                     if self.ai:
                         try:
-                            ai_decision = self.ai.analyze(ai_df, "no_position")
+                            ai_decision = self.ai.analyze(trading_context)
                         except Exception as e:
                             log.warning(f"AI analysis failed: {e}")
 
@@ -204,11 +367,11 @@ class TradingBot:
 
                 elif technical_signal == 'SELL' and self.in_position:
                     log.info(f"📉 Technical Signal [SELL] detected! Asking AI Ensemble for confirmation...")
-                    ai_df = self.process_data_for_ai(klines)
+                    trading_context = self.build_trading_context(klines)
                     ai_decision = None
                     if self.ai:
                         try:
-                            ai_decision = self.ai.analyze(ai_df, "in_position")
+                            ai_decision = self.ai.analyze(trading_context)
                         except Exception as e:
                             log.warning(f"AI analysis failed: {e}")
 
@@ -217,6 +380,7 @@ class TradingBot:
                         log.info("✅ Decision: SELL")
                     else:
                         log.info(f"❌ AI Ensemble REJECTED the SELL signal (AI said: {ai_decision}). Holding.")
+
 
                 self.execute_trade(final_decision)
 
