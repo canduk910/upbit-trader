@@ -28,3 +28,6 @@ redis
 
 # Upbit python client
 pyupbit
+
+# Websocket client for real-time market/trade streaming
+websocket-client

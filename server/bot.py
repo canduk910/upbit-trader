@@ -1,6 +1,8 @@
+import json
 import os
 import time
 import pandas as pd
+import redis
 import ta
 from server.upbit_api import UpbitAPI
 from server.strategy import RSIStrategy, VolatilityBreakoutStrategy, DualMomentumStrategy
@@ -60,6 +62,42 @@ class TradingBot:
         self.candle_count = config.CANDLE_COUNT
         self.loop_interval = config.LOOP_INTERVAL_SEC
         self.trade_amount_krw = config.TRADE_AMOUNT_KRW
+
+    def _init_redis_client(self):
+        url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        try:
+            client = redis.from_url(url, decode_responses=True)
+            client.ping()
+            log.info(f"Redis connected for websocket cache: {url}")
+            return client
+        except Exception as exc:
+            log.warning(f"Failed to connect to Redis ({url}): {exc}")
+            return None
+
+    def _fetch_cached_klines(self, market: str, count: int):
+        if self.redis_client is None:
+            return []
+        key = f"ws:candles:{market}"
+        try:
+            raw = self.redis_client.lrange(key, 0, count - 1)
+        except Exception as exc:
+            log.warning(f"Redis candle read failed for {market}: {exc}")
+            return []
+        records = []
+        for item in reversed(raw):
+            try:
+                payload = json.loads(item)
+            except Exception:
+                continue
+            records.append({
+                'candle_date_time_kst': payload.get('candle_date_time_kst'),
+                'opening_price': payload.get('open'),
+                'high_price': payload.get('high'),
+                'low_price': payload.get('low'),
+                'trade_price': payload.get('close'),
+                'candle_acc_trade_volume': payload.get('volume'),
+            })
+        return records
 
     # 설정 변경 시 컴포넌트 재초기화
     # 전략, 자금 관리자, AI 분석기 등을 재설정
@@ -398,11 +436,14 @@ class TradingBot:
                 self._detect_and_reload_config() # 설정 변경 감지 및 재로드
 
                 # 1. 시세 데이터 조회
-                klines = self.api.get_klines(self.market, self.timeframe, self.candle_count)
+                klines = self._fetch_cached_klines(self.market, self.candle_count)
                 if not klines:
-                    log.warning("Empty klines data. Retrying...")
-                    time.sleep(1)
-                    continue
+                    log.warning("Redis cache empty, falling back to REST klines")
+                    klines = self.api.get_klines(self.market, self.timeframe, self.candle_count)
+                    if not klines:
+                        log.warning("Empty klines data from API. Retrying...")
+                        time.sleep(1)
+                        continue
 
                 raw_df = pd.DataFrame(klines) # 원본 DataFrame 생성
 

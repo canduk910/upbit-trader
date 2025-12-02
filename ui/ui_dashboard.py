@@ -143,6 +143,33 @@ def api_request(method: str, path: str, params=None, json=None, timeout=10):
         raise RuntimeError(f"서버 호출 실패: {e}") from e
 
 
+def fetch_ws_status():
+    try:
+        resp = api_request('get', '/ws/status', timeout=5)
+        return resp.json(), None
+    except Exception as exc:
+        return None, exc
+
+
+def fetch_ws_trades(symbol: str, limit: int = 20):
+    try:
+        resp = api_request('get', '/ws/trades', params={'symbol': symbol, 'limit': limit}, timeout=5)
+        return resp.json(), None
+    except Exception as exc:
+        return None, exc
+
+
+def _format_ws_trade_timestamp(payload: Dict[str, Any]) -> str:
+    ts = payload.get('trade_timestamp') or payload.get('timestamp')
+    try:
+        if ts is None:
+            return '-'
+        tsf = float(ts) / 1000.0 if ts > 1e12 else float(ts)
+        return pd.to_datetime(tsf, unit='s').strftime('%H:%M:%S')
+    except Exception:
+        return '-'
+
+
 # --- Upbit public klines helper (cached) ---
 @st.cache_data(ttl=10)
 def fetch_klines_cached(market: str, timeframe: str = 'minute1', count: int = 200) -> pd.DataFrame | None:
@@ -534,7 +561,6 @@ def render_screening_page():
         st.session_state['search_clicked'] = False
     if search_clicked:
         st.session_state['search_clicked'] = True
-        # remember last query params to re-render on config changes
         st.session_state['screening_query'] = {
             'market_prefix': market_prefix,
             'top_n': top_n,
@@ -671,6 +697,7 @@ def render_positions_page():
 
     balances = None
     positions = None
+    positions_payload: Dict[str, Any] = {}
     api_errors: list[str] = []
 
     # Try dedicated endpoints first
@@ -694,7 +721,8 @@ def render_positions_page():
         resp2 = api_request('get', '/positions', timeout=6)
         if resp2 and resp2.status_code == 200:
             j2 = resp2.json()
-            if isinstance(j2, dict) and 'positions' in j2:
+            if isinstance(j2, dict):
+                positions_payload = j2
                 positions = j2.get('positions')
             else:
                 positions = j2
@@ -770,6 +798,15 @@ def render_positions_page():
     except Exception:
         pos_df = pd.DataFrame(columns=['symbol','side','qty','entry_price','unrealized_pnl'])
 
+    # Fetch history for chart
+    history = []
+    try:
+        resp_hist = api_request('get', '/positions/history', timeout=8)
+        if resp_hist and resp_hist.status_code == 200:
+            history = resp_hist.json().get('history', []) or []
+    except Exception:
+        history = []
+
     # Compute KRW-equivalent values for balances using backend price fetch
     try:
         bal_df = bal_df.copy()
@@ -838,8 +875,11 @@ def render_positions_page():
         bal_df['value_krw'] = None
 
     # Top metrics: use server-reported KRW cash and compute converted asset value from available prices only
-    krw_cash = float(reported_krw_from_server or 0.0)
-    conv_sum = 0.0
+    available_krw_payload = float(positions_payload.get('available_krw') or 0.0)
+    total_equity_payload = float(positions_payload.get('total_equity_krw') or 0.0)
+    excluded_assets = positions_payload.get('excluded_assets') or []
+    krw_cash = float(available_krw_payload or reported_krw_from_server or 0.0)
+    conv_sum = total_equity_payload if total_equity_payload else 0.0
     try:
         if not bal_df.empty and 'value_krw' in bal_df.columns and 'currency' in bal_df.columns:
             # only include non-KRW assets where value_krw is a real number (not None/NaN)
@@ -858,7 +898,7 @@ def render_positions_page():
 
     c1, c2, c3 = st.columns(3)
     c1.metric('원화 현금 잔고', f"{krw_cash:,.0f} 원")
-    c2.metric('환산 자산 가치(원)', f"{conv_sum:,.0f} 원")
+    c2.metric('평가자산 총액(원)', f"{(total_equity_payload or (krw_cash + conv_sum)):,.0f} 원")
     c3.metric('총 미확정 손익', f"{total_unrealized:,.0f} 원")
 
     # Show balances table with KRW conversion columns
@@ -913,20 +953,87 @@ def render_positions_page():
         if pos_df.empty:
             st.info('보유 포지션이 없습니다.')
         else:
-            disp_cols = [c for c in ['symbol','side','qty','entry_price','avg_price','unrealized_pnl'] if c in pos_df.columns]
-            disp = pos_df[disp_cols].copy()
-            for c in ['qty','entry_price','avg_price','unrealized_pnl']:
-                if c in disp.columns:
-                    disp[c] = pd.to_numeric(disp[c], errors='coerce')
-            _safe_dataframe(disp.fillna(''), hide_index=True)
+            # ensure required columns exist even if backend omits them
+            required_cols = ['symbol', 'size', 'entry_price', 'current_price', 'unrealized_pnl', 'unrealized_pnl_rate', 'notional_krw']
+            for col in required_cols:
+                if col not in pos_df.columns:
+                    pos_df[col] = None
+            disp = pos_df[required_cols].copy()
+            disp = disp.rename(columns={
+                'symbol': '종목티커',
+                'size': '수량',
+                'entry_price': '진입가격',
+                'current_price': '현재가격',
+                'unrealized_pnl': '평가손익',
+                'unrealized_pnl_rate': '손익비율',
+                'notional_krw': '평가금액',
+            })
+            for col in ('수량','진입가격','현재가격','평가손익','평가금액'):
+                disp[col] = disp[col].map(lambda v: f"{float(v):,.0f}" if v not in (None, '') and pd.notna(v) else '-')
+            disp['손익비율'] = disp['손익비율'].map(lambda v: f"{float(v):.2f}%" if v not in (None, '') and pd.notna(v) else '-')
+            _safe_dataframe(disp, hide_index=True)
+            if excluded_assets:
+                symbols = [item.get('symbol') for item in excluded_assets if isinstance(item, dict) and item.get('symbol')]
+                if symbols:
+                    st.info(f"현재가 미수신으로 제외된 종목: {', '.join(symbols)}")
+            st.caption(f"산출된 포지션: {len(disp)}개 · 가격 조회된 종목: {positions_payload.get('prices_fetched', 0)}개")
+            if history:
+                chart_cols = st.columns(2)
+                line_rows = []
+                for record in sorted(history, key=lambda item: item.get('ts', 0)):
+                    ts_value = float(record.get('ts', 0))
+                    row = {'date': pd.to_datetime(ts_value, unit='s', errors='coerce')}
+                    for snapshot in record.get('positions', []):
+                        symbol = snapshot.get('symbol')
+                        notional = snapshot.get('notional_krw')
+                        if symbol and notional is not None:
+                            row[symbol] = float(notional)
+                    line_rows.append(row)
+                if line_rows:
+                    line_df = pd.DataFrame(line_rows).set_index('date').sort_index()
+                else:
+                    line_df = pd.DataFrame()
 
-            if 'unrealized_pnl' in pos_df.columns:
-                pnl = pos_df[['symbol','unrealized_pnl']].dropna(subset=['unrealized_pnl']).sort_values('unrealized_pnl', ascending=False)
-                if not pnl.empty:
-                    colors = ['red' if v>0 else 'blue' for v in pnl['unrealized_pnl']]
-                    fig2 = go.Figure(data=[go.Bar(x=pnl['symbol'], y=pnl['unrealized_pnl'], marker=dict(color=colors))])
-                    fig2.update_layout(title='포지션별 미확정 손익', xaxis_title='심볼', yaxis_title='손익 (원)', height=320, margin=dict(l=10,r=10,t=30,b=30))
-                    st.plotly_chart(fig2, width='stretch')
+                # Time-series line chart for position values
+                with chart_cols[0]:
+                    st.subheader('포지션 가치 추이')
+                    if line_df.empty:
+                        st.info('포지션 가치 변화 차트에 사용할 데이터가 없습니다.')
+                    else:
+                        fig_line = go.Figure()
+                        for sym in line_df.columns:
+                            if sym == 'date':
+                                continue
+                            fig_line.add_trace(go.Scatter(
+                                x=line_df.index,
+                                y=line_df[sym],
+                                mode='lines',
+                                name=sym,
+                                hovertemplate='%{x}<br>%{y:,.0f} 원<extra></extra>'
+                            ))
+                        fig_line.update_layout(title='포지션별 가치 변화', xaxis_title='날짜', yaxis_title='가치 (KRW)', margin=dict(l=10,r=10,t=30,b=30), height=320)
+                        _safe_plotly_chart(fig_line)
+
+                # Bar chart for unrealized PnL
+                with chart_cols[1]:
+                    st.subheader('포지션별 손익 현황')
+                    pnl_df = pos_df[['symbol','unrealized_pnl']].copy()
+                    pnl_df = pnl_df.sort_values('unrealized_pnl')
+                    if pnl_df['unrealized_pnl'].dropna().empty:
+                        st.info('손익 차트에 사용할 데이터가 부족합니다.')
+                    else:
+                        colors = ['#d64f3a' if v>0 else '#1e40af' for v in pnl_df['unrealized_pnl'].fillna(0)]
+                        fig_bar = go.Figure()
+                        fig_bar.add_trace(go.Bar(
+                            x=pnl_df['symbol'],
+                            y=pnl_df['unrealized_pnl'],
+                            marker_color=colors,
+                            name='평가손익',
+                            hovertemplate='%{x}<br>%{y:,.0f}원<extra></extra>'
+                        ))
+                        fig_bar.update_layout(title='포지션별 손익', xaxis_title='종목', yaxis_title='손익 (원)', bargap=0.2, margin=dict(l=10,r=10,t=30,b=30), height=320)
+                        fig_bar.update_yaxes(zeroline=True, zerolinewidth=2, zerolinecolor='#94a3b8')
+                        _safe_plotly_chart(fig_bar)
     except Exception as e:
         st.error(f'포지션 표시 중 오류: {e}')
 
@@ -964,6 +1071,69 @@ def render_watcher_page(cfg: Dict[str, Any]):
                 st.success('Watcher 중지 요청을 보냈습니다.')
             except Exception as e:
                 st.error(f'Watcher 중지 오류: {e}')
+
+    st.divider()
+    st.subheader('WebSocket 스트리밍 상태')
+    ws_status_msg, ws_status_err = fetch_ws_status()
+    ws_running = False
+    ws_targets = []
+    if ws_status_msg:
+        ws_running = ws_status_msg.get('running', False)
+        ws_targets = ws_status_msg.get('targets') or []
+    if ws_status_err:
+        st.warning(f'WebSocket 상태를 가져오는 중 오류: {ws_status_err}')
+    st.markdown(
+        f"- 상태: {'실행 중' if ws_running else '대기 중'}  \
+- 구독 종목 수: {len(ws_targets)}"
+    )
+    ws_col1, ws_col2, ws_col3 = st.columns(3)
+    with ws_col1:
+        if st.button('WebSocket 시작', key='ws_btn_start'):
+            try:
+                api_request('post', '/ws/start', timeout=5)
+                st.success('WebSocket 리스너 시작 요청이 전송되었습니다.')
+            except Exception as exc:
+                st.error(f'WebSocket 시작 실패: {exc}')
+    with ws_col2:
+        if st.button('WebSocket 중지', key='ws_btn_stop'):
+            try:
+                api_request('post', '/ws/stop', timeout=5)
+                st.success('WebSocket 리스너 중지 요청이 전송되었습니다.')
+            except Exception as exc:
+                st.error(f'WebSocket 중지 실패: {exc}')
+    with ws_col3:
+        if st.button('상태 새로 고침', key='ws_btn_refresh'):
+            st.experimental_rerun()
+
+    st.caption('WebSocket은 Redis 및 exec_history.json에 실시간 데이터를 저장하며, UI는 Redis의 최근 체결을 표시합니다.')
+    selected_symbol = None
+    if ws_targets:
+        if 'ws_selected_symbol' not in st.session_state or st.session_state['ws_selected_symbol'] not in ws_targets:
+            st.session_state['ws_selected_symbol'] = ws_targets[0]
+        selected_symbol = st.selectbox('최근 체결을 볼 종목', ws_targets, key='ws_symbol_selector')
+    else:
+        selected_symbol = st.text_input('조회할 종목을 입력하세요', value='KRW-BTC')
+
+    trades_data, trades_err = fetch_ws_trades(selected_symbol, limit=10) if selected_symbol else (None, None)
+    if trades_err:
+        st.warning(f'실시간 체결을 가져오는 중 오류: {trades_err}')
+    elif trades_data and trades_data.get('trades'):
+        trades = trades_data['trades']
+        formatted = []
+        for trade in trades:
+            formatted.append({
+                '시간': _format_ws_trade_timestamp(trade),
+                '가격': f"{float(trade.get('trade_price', trade.get('price', 0)) or 0):,.0f}",
+                '거래량': f"{float(trade.get('trade_volume', trade.get('volume', 0)) or 0):,.4f}",
+                '방향': trade.get('ask_bid') or trade.get('side') or '-',
+            })
+        try:
+            dfs = pd.DataFrame(formatted)
+            _safe_dataframe(dfs)
+        except Exception:
+            st.write(formatted)
+    else:
+        st.info('선택한 종목의 최근 체결이 아직 없습니다. WebSocket 리스너가 실행 중인지 확인하세요.')
 
     # Show recent watcher status if available
     try:

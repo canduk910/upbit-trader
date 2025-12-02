@@ -21,6 +21,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed # for parallel p
 from server import config               # 런타임 설정 관리
 from server.upbit_api import UpbitAPI   # 업비트 API 연동
 from server.logger import log           # 로깅 설정
+from server.history import history_store
+from server.ws_listener import WebsocketListener
 
 # Token Bucket 구현 for prefetch
 # 간단한 토큰 버킷(rate limiter) 구현
@@ -90,12 +92,16 @@ async def lifespan(app: FastAPI): # 수명 주기 관리
 
     # 스케쥴러 시작
     start_prefetch_scheduler(interval=interval)
-
+    try:
+        start_ws_listener()
+    except Exception as exc:
+        log.warning(f'Failed to start websocket listener on startup: {exc}')
     try:
         yield
     finally:
         # 스케쥴러 중지
         stop_prefetch_scheduler()
+        stop_ws_listener()
 
 app = FastAPI(title="Upbit Trader Runtime API", lifespan=lifespan) # FastAPI 앱 생성
 
@@ -189,6 +195,21 @@ def _cache_get(key: str, ttl: int = _KLINES_CACHE_TTL):
         except Exception:
             return None
     return _klines_cache.get(key) # return (timestamp, value) or None
+
+# Websocket listener state
+_ws_listener: Optional[WebsocketListener] = None
+
+def start_ws_listener() -> None:
+    global _ws_listener
+    if _ws_listener and _ws_listener._thread and _ws_listener._thread.is_alive():
+        return
+    _ws_listener = WebsocketListener(redis_client=_redis_client)
+    _ws_listener.start()
+
+def stop_ws_listener() -> None:
+    global _ws_listener
+    if _ws_listener:
+        _ws_listener.stop()
 
 # Rate-limited Upbit klines fetcher
 # ticker_local: 업비트 로컬 티커명 (예: KRW-BTC)
@@ -939,8 +960,10 @@ def get_positions():
         notional = size * float(current_price)
         total_equity += notional
         unrealized = None
+        unrealized_rate = None
         if avg_price and avg_price > 0:
             unrealized = (float(current_price) - avg_price) * size
+            unrealized_rate = (float(current_price) - avg_price) / avg_price * 100
 
         pos = {
             'symbol': market,
@@ -949,15 +972,76 @@ def get_positions():
             'entry_price': avg_price if avg_price > 0 else None,
             'current_price': current_price,
             'unrealized_pnl': unrealized,
+            'unrealized_pnl_rate': unrealized_rate,
             'notional_krw': notional,
         }
         positions.append(pos)
 
     # Also include list of excluded assets so UI can show a friendly message.
-    return {
+    result = {
         'positions': positions,
         'total_equity_krw': total_equity,
         'available_krw': available_krw,
         'prices_fetched': len([p for p in price_map.values() if p is not None]),
         'excluded_assets': excluded_assets,
     }
+    history_store.record_snapshot({
+        'ts': time.time(),
+        'total_equity': total_equity,
+        'available_krw': available_krw,
+        'positions': [
+            {
+                'symbol': pos['symbol'],
+                'notional_krw': pos['notional_krw'],
+                'unrealized_pnl': pos['unrealized_pnl'],
+            }
+            for pos in positions
+        ],
+    })
+    return result
+
+
+@app.get('/positions/history')
+def get_positions_history(limit: int = 365, days: int = 365):
+    since = time.time() - float(days) * 86400
+    history = history_store.get_history(since=since, limit=limit)
+    return {'history': history}
+
+@app.post('/ws/start')
+def ws_start():
+    try:
+        start_ws_listener()
+        return {'status': 'started'}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Failed to start websocket listener: {exc}')
+
+@app.post('/ws/stop')
+def ws_stop():
+    try:
+        stop_ws_listener()
+        return {'status': 'stopped'}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Failed to stop websocket listener: {exc}')
+
+@app.get('/ws/status')
+def ws_status():
+    running = bool(_ws_listener and _ws_listener._thread and _ws_listener._thread.is_alive())
+    return {'running': running, 'targets': _ws_listener.targets if _ws_listener else []}
+
+@app.get('/ws/trades')
+def ws_trades(symbol: str, limit: int = 20):
+    if _redis_client is None:
+        raise HTTPException(status_code=503, detail='Redis cache unavailable; cannot read trades.')
+    if not symbol:
+        raise HTTPException(status_code=400, detail='symbol query parameter is required.')
+    max_limit = min(max(limit, 1), 200)
+    key = f'ws:trades:{symbol}'
+    raw = _redis_client.lrange(key, 0, max_limit - 1)
+    trades = []
+    try:
+        for item in raw:
+            import json as _json
+            trades.append(_json.loads(item))
+    except Exception:
+        trades = []
+    return {'symbol': symbol, 'trades': trades}

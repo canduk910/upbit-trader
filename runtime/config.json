@@ -1,7 +1,7 @@
 {
   "strategy_name": "VolatilityBreakout",
   "market": "KRW-BTC",
-  "timeframe": "minute5",
+  "timeframe": "minute15",
   "candle_count": 200,
   "loop_interval_sec": 5,
   "order_settings": {
@@ -15,16 +15,8 @@
     "fraction": 0.5
   },
   "strategy_params": {
-    "RSI": {
-      "period": 14,
-      "oversold": 30,
-      "overbought": 70
-    },
     "VolatilityBreakout": {
       "k_value": 0.5
-    },
-    "DualMomentum": {
-      "window": 12
     }
   },
   "ai_ensemble": {
