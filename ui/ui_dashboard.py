@@ -159,6 +159,40 @@ def fetch_ws_trades(symbol: str, limit: int = 20):
         return None, exc
 
 
+def _format_ws_ts(ts: Any) -> str:
+    if ts is None:
+        return '-'
+    try:
+        value = float(ts)
+    except Exception:
+        return '-'
+    if value > 1e12:
+        value /= 1000.0
+    ts = pd.to_datetime(value, unit='s', utc=True)
+    try:
+        ts = ts.tz_convert('Asia/Seoul')
+    except Exception:
+        ts = ts.tz_localize('Asia/Seoul', ambiguous='NaT', nonexistent='shift_forward')
+    return ts.strftime('%Y-%m-%d %H:%M:%S')
+
+
+def fetch_ws_stats(last_hour_sec: int = 3600, recent_limit: int = 10):
+    try:
+        resp = api_request('get', '/ws/stats', params={'last_hour_sec': last_hour_sec, 'recent_limit': recent_limit}, timeout=5)
+        return resp.json(), None
+    except Exception as exc:
+        return None, exc
+
+
+def fetch_ws_executions(limit: int = 0):
+    try:
+        params = {'limit': limit} if limit else {}
+        resp = api_request('get', '/ws/executions', params=params, timeout=10)
+        return resp.json(), None
+    except Exception as exc:
+        return None, exc
+
+
 def _format_ws_trade_timestamp(payload: Dict[str, Any]) -> str:
     ts = payload.get('trade_timestamp') or payload.get('timestamp')
     try:
@@ -433,7 +467,7 @@ def render_config_page(cfg: Dict[str, Any]):
         prefetch_no_redis_max_count = st.number_input('Redis 없을 때 최대 캔들 수', min_value=1, value=int(cfg.get('prefetch_no_redis_max_count', 120)), help='Redis가 없을 때는 너무 많이 가져오지 않도록 제한해요.')
         prefetch_rate_per_sec = st.number_input('초당 허용 호출(토큰)', min_value=0.0, value=float(cfg.get('prefetch_rate_per_sec', 5)), help='초당 몇 번의 호출을 허용할지 토큰으로 정해요.')
         prefetch_rate_capacity = st.number_input('버스트 허용 토큰(추가 여유)', min_value=1, value=int(cfg.get('prefetch_rate_capacity', int(prefetch_rate_per_sec or 1))), help='잠깐 동안 더 많은 호출을 허용할 수 있는 여유량이에요.')
-        prefetch_max_concurrent = st.number_input('최대 동시 작업 수', min_value=1, value=int(cfg.get('prefetch_max_concurrent', 3)), help='한 번에 병렬로 실행할 작업 최대 수예요.')
+        prefetch_max_concurrent = st.number_input('최대 동시 작업 수', min_value=1, value=int(cfg.get('prefetch_max_concurrent', 3)), help='한 번에 병렬로 수행할 최대 작업 수예요.')
         prefetch_token_wait_timeout = st.number_input('토큰 대기 최대 시간(초)', min_value=0.0, value=float(cfg.get('prefetch_token_wait_timeout', 10.0)), help='토큰을 기다리는 최대 시간이에요. 너무 작으면 실패할 수 있어요.')
         # Cache TTL
         klines_cache_ttl = st.number_input('차트 데이터 캐시 유지시간(초)', min_value=1, value=int(cfg.get('KLINES_CACHE_TTL', os.getenv('KLINES_CACHE_TTL', '600'))), help='서버가 저장해두는 데이터가 얼마나 오래 유지될지 초 단위로 적어요.')
@@ -533,6 +567,88 @@ def render_config_page(cfg: Dict[str, Any]):
                 st.success('서버 재로딩 요청 성공')
             except Exception as e:
                 st.error(str(e))
+
+
+def render_ws_monitoring_page():
+    st.title('WebSocket 모니터링')
+    st.write('실시간 WebSocket 스트리밍 현황과 체결 기록을 한눈에 확인합니다.')
+
+    stats, stats_err = fetch_ws_stats()
+    if stats_err:
+        st.warning(f'WebSocket 통계 수집 오류: {stats_err}')
+        stats = None
+
+    if stats:
+        cols = st.columns(4)
+        metrics = (
+            ('시세 수신 성공', stats.get('ticker_success', 0)),
+            ('시세 수신 실패', stats.get('ticker_failure', 0)),
+            ('체결 수신 성공', stats.get('order_success', 0)),
+            ('체결 수신 실패', stats.get('order_failure', 0)),
+        )
+        for col, (label, value) in zip(cols, metrics):
+            col.metric(label, f"{int(value):,}")
+        status_text = '실행 중' if stats.get('running') else '대기 중'
+        st.caption(
+            f"WebSocket 상태: {status_text} · 구독 종목: {len(stats.get('targets', []))} · "
+            f"최근 1시간 시세 성공:{stats.get('last_hour_ticker_success', 0)}, 실패:{stats.get('last_hour_ticker_failure', 0)} / "
+            f"체결 성공:{stats.get('last_hour_order_success', 0)}, 실패:{stats.get('last_hour_order_failure', 0)}"
+        )
+    else:
+        st.info('WebSocket 통계를 불러올 수 없습니다. 리스너 실행 여부를 확인해 주세요.')
+
+    st.subheader('분봉 수신 현황 (최근 10개)')
+    rows = []
+    if stats:
+        for item in stats.get('recent_ticker_events', []):
+            rows.append({
+                '시간': _format_ws_ts(item.get('ts')),
+                '종목': item.get('symbol') or '-',
+                '타입': item.get('type') or '-',
+                '결과': '성공' if item.get('success') else '실패',
+            })
+    if rows:
+        _safe_dataframe(pd.DataFrame(rows), hide_index=True)
+    else:
+        st.info('최근 분봉 수신 기록이 없습니다.')
+
+    st.subheader('체결 수신 현황 (exec_history)')
+    executions, exec_err = fetch_ws_executions()
+    exec_table = []
+    if exec_err:
+        st.warning(f'체결 기록 조회 오류: {exec_err}')
+    elif executions and isinstance(executions.get('executions'), list):
+        data = executions['executions']
+        for entry in sorted(data, key=lambda e: e.get('ts', 0), reverse=True):
+            exec_table.append({
+                '시간': _format_ws_ts(entry.get('ts')),
+                '심볼': entry.get('symbol') or '-',
+                '사이드': entry.get('side') or entry.get('ask_bid') or '-',
+                '체결가': entry.get('price') or entry.get('order_price') or '-',
+                '수량': entry.get('size') or entry.get('trade_volume') or '-',
+                '장부가': entry.get('entry_price') or '-',
+            })
+    if exec_table:
+        try:
+            df_exec = pd.DataFrame(exec_table)
+            def _format_side(label: str) -> str:
+                try:
+                    key = str(label or '').strip().lower()
+                except Exception:
+                    return label
+                if key in ('ask', 'sell', '매도'):
+                    return '매도'
+                if key in ('bid', 'buy', '매수'):
+                    return '매수'
+                return label
+            if '사이드' in df_exec.columns:
+                df_exec['사이드'] = df_exec['사이드'].map(_format_side)
+            _safe_dataframe(df_exec, hide_index=True)
+        except Exception:
+            st.write(exec_table)
+    else:
+        if not exec_err:
+            st.info('체결 기록이 없습니다. WebSocket 리스너가 실행 중인지 확인하세요.')
 
 
 def render_screening_page():
@@ -1153,6 +1269,7 @@ sb.caption('원하는 기능으로 바로 가기')
 
 # Fixed NAV order requested by user
 NAV_OPTIONS = [
+    'WebSocket 모니터링',
     '종목스크리닝',
     '이벤트 감시자 관리',
     '원화잔고 및 포지션 분석',
@@ -1197,7 +1314,9 @@ if pending_selection and pending_selection != selected_tab:
 
 # page dispatch using session state
 page = st.session_state.get('page', NAV_OPTIONS[0])
-if page == '종목스크리닝':
+if page == 'WebSocket 모니터링':
+    render_ws_monitoring_page()
+elif page == '종목스크리닝':
     render_screening_page()
 elif page == '이벤트 감시자 관리':
     render_watcher_page(cfg)

@@ -22,7 +22,13 @@ from server import config               # 런타임 설정 관리
 from server.upbit_api import UpbitAPI   # 업비트 API 연동
 from server.logger import log           # 로깅 설정
 from server.history import history_store
-from server.ws_listener import WebsocketListener
+from server.ws_listener_private import (
+    WebsocketListener,
+    _load_ws_stats_file,
+    summarize_ws_stats,
+    read_exec_history,
+)
+from server.ws_listener_public import TickerWebsocketListener
 
 # Token Bucket 구현 for prefetch
 # 간단한 토큰 버킷(rate limiter) 구현
@@ -94,6 +100,7 @@ async def lifespan(app: FastAPI): # 수명 주기 관리
     start_prefetch_scheduler(interval=interval)
     try:
         start_ws_listener()
+        start_ticker_listener()
     except Exception as exc:
         log.warning(f'Failed to start websocket listener on startup: {exc}')
     try:
@@ -102,6 +109,7 @@ async def lifespan(app: FastAPI): # 수명 주기 관리
         # 스케쥴러 중지
         stop_prefetch_scheduler()
         stop_ws_listener()
+        stop_ticker_listener()
 
 app = FastAPI(title="Upbit Trader Runtime API", lifespan=lifespan) # FastAPI 앱 생성
 
@@ -198,6 +206,7 @@ def _cache_get(key: str, ttl: int = _KLINES_CACHE_TTL):
 
 # Websocket listener state
 _ws_listener: Optional[WebsocketListener] = None
+_ticker_listener: Optional[TickerWebsocketListener] = None
 
 def start_ws_listener() -> None:
     global _ws_listener
@@ -206,10 +215,25 @@ def start_ws_listener() -> None:
     _ws_listener = WebsocketListener(redis_client=_redis_client)
     _ws_listener.start()
 
+
+def start_ticker_listener() -> None:
+    global _ticker_listener
+    if _ticker_listener and _ticker_listener._thread and _ticker_listener._thread.is_alive():
+        return
+    _ticker_listener = TickerWebsocketListener(redis_client=_redis_client)
+    _ticker_listener.start()
+
+
 def stop_ws_listener() -> None:
     global _ws_listener
     if _ws_listener:
         _ws_listener.stop()
+
+
+def stop_ticker_listener() -> None:
+    global _ticker_listener
+    if _ticker_listener:
+        _ticker_listener.stop()
 
 # Rate-limited Upbit klines fetcher
 # ticker_local: 업비트 로컬 티커명 (예: KRW-BTC)
@@ -726,7 +750,7 @@ def klines_batch(payload: KlinesBatchRequest):
                             if len(parts) >= 3:
                                 # count 부분 (마지막 부분)
                                 kcnt = int(parts[-1])
-                                # 요청보다 크고 현재 최상위 후보보다 큰 경우
+                                # 요청한 카운트보다 크고 현재 최상위 후보보다 큰 경우
                                 if kcnt >= count and kcnt > best_cnt:
                                     best = k        # 후보 키 갱신
                                     best_cnt = kcnt # 후보 카운트 갱신
@@ -790,23 +814,26 @@ def klines_batch(payload: KlinesBatchRequest):
 
     return {'klines': result}
 
+# --- Private API Endpoints ---
+# 잔고 조회 엔드포인트
+# Upbit 개인 API 키를 사용하여 잔고 조회
+# 키가 구성되지 않은 경우 503 반환
+# 이 엔드포인트는 짧은 TTL(_BALANCES_CACHE_TTL)로 잔고를 캐시하여 반복된 Upbit 호출을 줄임
+# 반환값에는 추가 진단 필드 포함:
+#   - balances: Upbit에서 반환된 원시 잔고 리스트
+#   - reported_krw_balance: 잔고에서 보고된 KRW 잔고 (없으면 0)
+#   - cached: 응답이 서버 캐시에서 왔는지 여부
+#   - cached_ts: 캐시된 시점 타임스탬프
 @app.get('/balances')
 def get_balances():
-    """Return account balances from Upbit using private API keys.
-    If no keys are configured, return 503 with informative message.
-    This endpoint will cache the balances for a short TTL (_BALANCES_CACHE_TTL) to reduce repeated Upbit calls.
-    Response includes extra diagnostic fields:
-      - balances: raw balances list (as returned by Upbit)
-      - reported_krw_balance: numeric KRW balance as reported in balances (0 if none)
-      - cached: whether the response came from server cache
-      - cached_ts: timestamp when cached
-    """
+    # 잔고 조회 엔드포인트
     if _upbit_private is None:
         raise HTTPException(status_code=503, detail='Upbit API keys not configured on server; balances unavailable')
 
     cache_key = 'upbit:balances:all'
     now = time.time()
-    # Try cache first
+
+    # 캐시 조회 시도
     cached = _cache_get(cache_key, ttl=_BALANCES_CACHE_TTL)
     if cached and (now - cached[0]) < _BALANCES_CACHE_TTL:
         bl = cached[1]
@@ -820,22 +847,23 @@ def get_balances():
             bl = _upbit_private.get_balances()
         except Exception as e:
             log.error(f'Balances retrieval failed: {e}')
-            # if cache exists return cached even if stale (best-effort)
+            # 캐시가 존재하면 캐시된 값 반환 (최선의 노력)
             if cached:
                 bl = cached[1]
                 cached_flag = True
                 cached_ts = cached[0]
             else:
                 raise HTTPException(status_code=502, detail=f'Upbit API call failed: {e}')
-        # store even None to avoid repeated bad calls
+        # 캐시 설정 (실패 시에도 캐시하여 반복 실패 방지)
         _cache_set(cache_key, bl, ttl=_BALANCES_CACHE_TTL)
 
-    # compute reported KRW balance from returned balances
+    # KRW 잔고 계산 (반환된 잔고에서)
+    # 'currency' 또는 'unit' 필드 사용
     reported_krw = 0.0
     try:
         if isinstance(bl, list):
             for item in bl:
-                # Upbit /v1/accounts returns items with 'currency' and 'balance'
+                # 업비트API /v1/accounts는 'currency'와 'balance' 필드를 가진 항목 반환
                 try:
                     cur = str(item.get('currency') or item.get('unit') or '').upper()
                     bal = float(item.get('balance') or 0.0)
@@ -844,7 +872,7 @@ def get_balances():
                 if cur == 'KRW' or cur.startswith('KRW'):
                     reported_krw += bal
         elif isinstance(bl, dict):
-            # sometimes a dict wrapper
+            # 딕셔너리 형태인 경우 'balances' 키에서 리스트 추출
             lst = bl.get('balances') if 'balances' in bl else None
             if isinstance(lst, list):
                 for item in lst:
@@ -865,14 +893,35 @@ def get_balances():
         'cached_ts': cached_ts,
     }
 
+# 포지션 조회 엔드포인트
+# Upbit 개인 API 키를 사용하여 잔고 조회 후 현재 가격과 결합하여 포지션 계산
+# 키가 구성되지 않은 경우 503 반환
+# 각 자산별 포지션 정보와 요약 총계 반환
+# 포지션 정보에는 다음 필드 포함:
+#   - symbol: 마켓 심볼 (예: KRW-BTC)
+#   - side: 포지션 방향 (항상 'LONG'으로 설정)
+#   - size: 보유 수량
+#   - entry_price: 평균 매수가 (없으면 null)
+#   - current_price: 현재 가격
+#   - unrealized_pnl: 미실현 손익 (없으면 null)
+#   - unrealized_pnl_rate: 미실현 손익률 (없으면 null)
+#   - notional_krw: 원화 기준 명목 가치
+# 요약 정보에는 다음 필드 포함:
+#   - total_equity_krw: 총 자산 가치 (원화 기준)
+#   - available_krw: 사용 가능한 원화 잔고
+#   - prices_fetched: 현재 가격을 성공적으로 조회한 자산 수
+#   - excluded_assets: 현재 가격을 조회하지 못해 제외된 자산 목록 (심볼 및 사유 포함)
+# 포지션 스냅샷은 히스토리 스토어에 기록됨
+# 반환값 예시:
+# {
+#   "positions": [ {...}, {...}, ... ],
+#   "total_equity_krw": 12345678.9,
+#   "available_krw": 2345678.9,
+#   "prices_fetched": 5,
+#   "excluded_assets": [ {"symbol": "KRW-XYZ", "reason": "no_price"}, ... ]
+# }
 @app.get("/positions")
 def get_positions():
-    """Return account positions computed from Upbit balances and current prices.
-
-    Uses the private API to fetch account balances and the public API to fetch
-    latest prices (rate-limited). Returns JSON with per-asset position info and
-    summary totals.
-    """
     if _upbit_private is None:
         raise HTTPException(status_code=503, detail='Upbit API keys not configured on server; positions unavailable')
 
@@ -886,7 +935,7 @@ def get_positions():
     total_equity = 0.0
     available_krw = 0.0
 
-    # Build list of markets to query for price
+    #시장리스트 작성 및 통화맵 작성 (가격 조회용)
     markets = []
     currency_map = {}
     try:
@@ -894,7 +943,8 @@ def get_positions():
             cur = str(item.get('currency') or item.get('unit') or '').upper()
             bal = float(item.get('balance') or 0) if item is not None else 0.0
             locked = float(item.get('locked') or 0) if item is not None else 0.0
-            # KRW cash handling
+
+            # 원화 현금잔고 처리
             if cur == 'KRW' or cur.startswith('KRW'):
                 available_krw += bal
                 total_equity += bal
@@ -912,7 +962,7 @@ def get_positions():
     except Exception as e:
         log.warning(f'Error while parsing balances for positions: {e}')
 
-    # Fetch current prices (1 candle minute1, count=1) for each market (rate-limited)
+    # 현재가격 조회 (1개 캔들 minute1, count=1) (조회수 제한 주의)
     price_map = {}
     for m in set(markets):
         try:
@@ -927,11 +977,13 @@ def get_positions():
                 try:
                     first = kl[0]
                     price_candidate = None
-                    # support dict-like records
+
+                    # 딕셔너리 레코드 작업
+                    # (Upbit API는 'trade_price' 사용)
                     if isinstance(first, dict):
                         price_candidate = first.get('trade_price') or first.get('close')
                     else:
-                        # try attribute access (some wrappers may expose .close or .trade_price)
+                        # 속성 접근 시도 (일부 래퍼는 .close 또는 .trade_price 노출 가능)
                         price_candidate = getattr(first, 'trade_price', None) or getattr(first, 'close', None)
                     if price_candidate is None:
                         price = None
@@ -944,7 +996,7 @@ def get_positions():
              log.warning(f'Unexpected error fetching price for {m}: {e}')
              price_map[m] = None
 
-    # Build positions with computed PnL and notional
+    # 포지션 구성 및 미실현 손익/명목 가치 계산
     excluded_assets = []
     for market, meta in currency_map.items():
         cur = meta['currency']
@@ -952,7 +1004,7 @@ def get_positions():
         avg_price = float(meta.get('avg_buy_price') or 0.0)
         current_price = price_map.get(market)
 
-        # Skip assets without a current price (user requested) and report them
+        # 자산 현재 가격이 없으면 건너뛰고 보고
         if current_price is None:
             excluded_assets.append({'symbol': market, 'reason': 'no_price'})
             continue
@@ -1011,6 +1063,7 @@ def get_positions_history(limit: int = 365, days: int = 365):
 def ws_start():
     try:
         start_ws_listener()
+        start_ticker_listener()
         return {'status': 'started'}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Failed to start websocket listener: {exc}')
@@ -1019,6 +1072,7 @@ def ws_start():
 def ws_stop():
     try:
         stop_ws_listener()
+        stop_ticker_listener()
         return {'status': 'stopped'}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Failed to stop websocket listener: {exc}')
@@ -1027,6 +1081,24 @@ def ws_stop():
 def ws_status():
     running = bool(_ws_listener and _ws_listener._thread and _ws_listener._thread.is_alive())
     return {'running': running, 'targets': _ws_listener.targets if _ws_listener else []}
+
+@app.get('/ws/stats')
+def ws_stats(last_hour_sec: int = 3600, recent_limit: int = 10):
+    raw_stats = _load_ws_stats_file()
+    summary = summarize_ws_stats(raw_stats, last_hour_secs=last_hour_sec, recent_limit=recent_limit)
+    summary.update({
+        'running': bool(_ws_listener and _ws_listener._thread and _ws_listener._thread.is_alive()),
+        'targets': _ws_listener.targets if _ws_listener else [],
+    })
+    return summary
+
+@app.get('/ws/executions')
+def ws_executions(limit: int = 0):
+    try:
+        entries = read_exec_history(limit=limit)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Failed to load exec history: {exc}')
+    return {'executions': entries}
 
 @app.get('/ws/trades')
 def ws_trades(symbol: str, limit: int = 20):

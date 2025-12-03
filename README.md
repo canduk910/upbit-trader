@@ -78,9 +78,9 @@
 4. `runtime/history` 디렉터리가 존재하므로 컨테이너 재기동 후에도 최대 N개(기본 720개) 히스토리 유지해 시계열 차트를 부드럽게 만듭니다.
 
 ### 🌀 WebSocket→캐시→봇/API/UI 흐름
-1. `server/ws_listener.py`는 `ws_timeframes`(`runtime/config.json`의 `timeframe`, `ws_timeframes` 필드 포함)의 여러 간격을 자동으로 생성하며 `ticker` 타입 메시지로부터 1분봉을 집계합니다.
+1. `server/ws_listener_private.py`(MyOrder 전용)와 `server/ws_listener_public.py`(공용 ticker 전용)로 WebSocket 핸들러가 분리되어 있고, `ws_timeframes`(`runtime/config.json`의 `timeframe`, `ws_timeframes` 필드 포함)를 기반으로 `ticker` 메시지로부터 1분봉을 집계합니다.
 2. 실제 업비트 주문 `order` 이벤트는 `runtime/history/exec_history.json`에 기록되고, `ws:trades:{ticker}` 리스트와 `ws:candles:{timeframe}:{ticker}` 키로 Redis에도 저장됩니다.
-3. `server/bot.py`는 가장 먼저 Redis `ws:candles:{desired_timeframe}:{ticker}` 캐시를 읽고(없으면 REST 호출), `ws_listener`가 만든 여러 타임프레���을 그대로 전략에 공급합니다.
+3. `server/bot.py`는 가장 먼저 Redis `ws:candles:{desired_timeframe}:{ticker}` 캐시를 읽고(없으면 REST 호출), `ws_listener_private`이 만든 여러 타임프레임을 그대로 전략에 공급합니다.
 4. FastAPI의 `/klines_batch`는 기존 `ticker|timeframe|count` 캐시를 사용하므로 WebSocket 캔들 캐시와는 별개이며, UI는 항상 `/klines_batch` → `FastAPI` → `_cache_get` 흐름을 통해 데이터를 가져옵니다.
 
 ```

@@ -43,6 +43,9 @@ class TradingBot:
         # initialize strategy/money manager/ai
         self._reinit_components()
 
+        # redis client for candle cache access
+        self.redis_client = self._init_redis_client()
+
         # 3. 초기 자산 상태 확인
         self.in_position = self.check_initial_position()
         log.info(f"Initial Position Status: {'HOLDING (매도 대기)' if self.in_position else 'NO POSITION (매수 대기)'}")

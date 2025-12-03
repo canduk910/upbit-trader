@@ -6,6 +6,13 @@ import threading
 import os
 from pathlib import Path
 
+# Ensure the logging process uses Korean Standard Time for timestamps
+os.environ.setdefault('TZ', 'Asia/Seoul')
+try:
+    time.tzset()
+except Exception:
+    pass
+
 class DedupFilter(logging.Filter):
     """Filter that suppresses duplicate log messages within a time window.
     Identical messages (same level and message text) logged within
@@ -137,5 +144,9 @@ def setup_logger(name='UpbitBotLogger', log_file='trading_bot.log', level=loggin
 
     return logger
 
+
+def get_logger(name='UpbitBotLogger', log_file='trading_bot.log', level=logging.INFO):
+    return setup_logger(name=name, log_file=log_file, level=level)
+
 # 전역 로거 인스턴스 생성
-log = setup_logger()
+log = get_logger()
