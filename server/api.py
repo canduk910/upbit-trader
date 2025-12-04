@@ -15,6 +15,7 @@ except Exception:
 
 # 외부라이브러리 임포트
 import redis # Redis 클라이언트
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed # for parallel prefetching
 
 # 내부API 모듈 임포트
@@ -22,13 +23,13 @@ from server import config               # 런타임 설정 관리
 from server.upbit_api import UpbitAPI   # 업비트 API 연동
 from server.logger import log           # 로깅 설정
 from server.history import history_store
-from server.ws_listener_private import (
-    WebsocketListener,
-    _load_ws_stats_file,
+from server.ws_listener_base import (
+    load_ws_stats,
     summarize_ws_stats,
     read_exec_history,
 )
-from server.ws_listener_public import TickerWebsocketListener
+from server.ws_listener_private import PrivateWebsocketListener
+from server.ws_listener_public import PublicWebsocketlistener
 
 # Token Bucket 구현 for prefetch
 # 간단한 토큰 버킷(rate limiter) 구현
@@ -205,14 +206,14 @@ def _cache_get(key: str, ttl: int = _KLINES_CACHE_TTL):
     return _klines_cache.get(key) # return (timestamp, value) or None
 
 # Websocket listener state
-_ws_listener: Optional[WebsocketListener] = None
-_ticker_listener: Optional[TickerWebsocketListener] = None
+_ws_listener: Optional[PrivateWebsocketListener] = None
+_ticker_listener: Optional[PublicWebsocketlistener] = None
 
 def start_ws_listener() -> None:
     global _ws_listener
     if _ws_listener and _ws_listener._thread and _ws_listener._thread.is_alive():
         return
-    _ws_listener = WebsocketListener(redis_client=_redis_client)
+    _ws_listener = PrivateWebsocketListener(redis_client=_redis_client)
     _ws_listener.start()
 
 
@@ -220,7 +221,7 @@ def start_ticker_listener() -> None:
     global _ticker_listener
     if _ticker_listener and _ticker_listener._thread and _ticker_listener._thread.is_alive():
         return
-    _ticker_listener = TickerWebsocketListener(redis_client=_redis_client)
+    _ticker_listener = PublicWebsocketlistener(redis_client=_redis_client)
     _ticker_listener.start()
 
 
@@ -1084,7 +1085,7 @@ def ws_status():
 
 @app.get('/ws/stats')
 def ws_stats(last_hour_sec: int = 3600, recent_limit: int = 10):
-    raw_stats = _load_ws_stats_file()
+    raw_stats = load_ws_stats()
     summary = summarize_ws_stats(raw_stats, last_hour_secs=last_hour_sec, recent_limit=recent_limit)
     summary.update({
         'running': bool(_ws_listener and _ws_listener._thread and _ws_listener._thread.is_alive()),
@@ -1117,3 +1118,46 @@ def ws_trades(symbol: str, limit: int = 20):
     except Exception:
         trades = []
     return {'symbol': symbol, 'trades': trades}
+
+
+def _ws_ticker_targets() -> List[str]:
+    if _ws_listener:
+        return _ws_listener.targets
+    universe = config._config.get('universe')
+    if isinstance(universe, list) and universe:
+        return universe
+    return [
+        'KRW-BTC',
+        'KRW-ETH',
+        'KRW-ADA',
+        'KRW-XRP',
+        'KRW-SOL',
+    ]
+
+
+@app.get('/ws/ticker_data')
+def ws_ticker_data():
+    if _redis_client is None:
+        raise HTTPException(status_code=503, detail='Redis cache unavailable; cannot read ticker data.')
+    targets = _ws_ticker_targets()
+    payloads: List[Dict[str, Any]] = []
+    for symbol in targets:
+        key = f'ws:ticker:{symbol}'
+        raw = _redis_client.get(key)
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        payloads.append({
+            'symbol': symbol,
+            'opening_price': data.get('opening_price'),
+            'high_price': data.get('high_price'),
+            'low_price': data.get('low_price'),
+            'trade_price': data.get('trade_price') or data.get('trade_price'),
+            'prev_closing_price': data.get('prev_closing_price'),
+            'change': data.get('change'),
+            'timestamp': data.get('trade_timestamp') or data.get('timestamp'),
+        })
+    return {'tickers': payloads}

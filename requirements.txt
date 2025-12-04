@@ -22,6 +22,7 @@ uvicorn
 
 # Streamlit UI
 streamlit
+streamlit-autorefresh
 
 # Redis client for caching
 redis

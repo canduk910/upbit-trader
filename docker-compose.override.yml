@@ -1,8 +1,11 @@
 services:
   backend:
+    env_file:
+      - server/.env
     volumes:
       - ./:/app:cached
       - ./logs:/app/logs
+      - ./runtime:/app/runtime
     command: sh -c "pip install -r requirements.txt --no-cache-dir || true && uvicorn server.api:app --app-dir /app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/server"
     environment:
       - REDIS_URL=redis://redis:6379/0
@@ -10,15 +13,57 @@ services:
       - "8000:8000"
 
   ui:
+    env_file:
+      - server/.env
     volumes:
       - ./:/app:cached
       - ./logs:/app/logs
+      - ./runtime:/app/runtime
     command: sh -c "pip install -r requirements.txt --no-cache-dir || true && streamlit run ui/ui_dashboard.py --server.port 8501 --server.address 0.0.0.0"
     ports:
       - "8501:8501"
 
   bot:
+    env_file:
+      - server/.env
     volumes:
       - ./:/app:cached
       - ./logs:/app/logs
+      - ./runtime:/app/runtime
     command: sh -c "pip install -r requirements.txt --no-cache-dir || true && python -m server.bot"
+
+  ws_listener_public:
+    env_file:
+      - server/.env
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: upbit-trader-ws-listener-public-dev
+    working_dir: /app
+    volumes:
+      - ./:/app:cached
+      - ./logs:/app/logs
+      - ./runtime:/app/runtime
+    command: sh -c "pip install -r requirements.txt --no-cache-dir || true && python -m server.ws_listener_public"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379/0
+
+  ws_listener_private:
+    env_file:
+      - server/.env
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: upbit-trader-ws-listener-private-dev
+    working_dir: /app
+    volumes:
+      - ./:/app:cached
+      - ./logs:/app/logs
+      - ./runtime:/app/runtime
+    command: sh -c "pip install -r requirements.txt --no-cache-dir || true && python -m server.ws_listener_private"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379/0

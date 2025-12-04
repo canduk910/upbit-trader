@@ -13,11 +13,20 @@ if os.path.exists(dotenv_path):
 else:
     log.warning("server/.env file not found. Please create one with your API keys.")
 
-# 환경 변수에서 API 키 가져오기
-UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY")
-UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# 환경 변수에서 API 키 가져오기 (따옴표/공백 제거)
+def _read_env(key: str) -> str | None:
+    val = os.getenv(key)
+    if val is None:
+        return None
+    val = val.strip()
+    if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+        val = val[1:-1]
+    return val or None
+
+UPBIT_ACCESS_KEY = _read_env("UPBIT_ACCESS_KEY")
+UPBIT_SECRET_KEY = _read_env("UPBIT_SECRET_KEY")
+OPENAI_API_KEY = _read_env("OPENAI_API_KEY")
+GEMINI_API_KEY = _read_env("GEMINI_API_KEY")
 
 # --- 2. runtime/config.json 파일에서 설정 파라미터 로드 ---
 def _get_runtime_config_path():
@@ -122,7 +131,10 @@ _sync_globals_from_config(_config)
 
 # expose some convenience getters
 def get_setting(key: str, default=None):
-    return _config.get(key, default)
+    value = _config.get(key, default)
+    if value is None:
+        value = os.environ.get(key, default)
+    return value
 
 
 def reload_config():

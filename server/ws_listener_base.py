@@ -1,6 +1,7 @@
 import abc
 import json
 import os
+import tempfile
 import threading
 import time
 from collections import deque
@@ -11,16 +12,13 @@ from typing import Any, Dict, List, Optional
 import websocket  # websocket-client
 
 from server.config import get_setting
-from server.logger import get_logger
+from server.logger import get_logger, logging
 
 UPBIT_WS_URL = "wss://api.upbit.com/websocket/v1"
 EXEC_HISTORY_DIR = Path(__file__).resolve().parents[1] / "runtime" / "history"
 EXEC_HISTORY_LOCK = threading.Lock()
 WS_STATS_FILE = EXEC_HISTORY_DIR / "ws_stats.json"
 KST = timezone(timedelta(hours=9))
-
-logger = get_logger(name="UpbitWSBase", log_file="ws_listener.log", level=logging.INFO)
-
 
 def _timeframe_to_seconds(timeframe: str) -> int:
     if not isinstance(timeframe, str):
@@ -52,15 +50,69 @@ def _get_universe_targets() -> List[str]:
     return ["KRW-BTC", "KRW-ETH", "KRW-ADA", "KRW-XRP", "KRW-SOL"]
 
 
-def _load_ws_stats() -> Dict[str, Any]:
+def _load_stats_from_path(path: Path) -> Dict[str, Any]:
     _ensure_history_dir()
-    if not WS_STATS_FILE.exists():
+    if not path.exists():
         return {"total_success": 0, "total_failure": 0, "history": []}
     try:
-        with WS_STATS_FILE.open("r", encoding="utf-8") as fp:
+        with path.open("r", encoding="utf-8") as fp:
             return json.load(fp)
     except Exception:
         return {"total_success": 0, "total_failure": 0, "history": []}
+
+
+def load_ws_stats() -> Dict[str, Any]:
+    return _load_stats_from_path(WS_STATS_FILE)
+
+
+def summarize_ws_stats(raw_stats: Dict[str, Any], last_hour_secs: int = 3600, recent_limit: int = 10) -> Dict[str, Any]:
+    totals = {
+        'total_success': int(raw_stats.get('total_success', 0)),
+        'total_failure': int(raw_stats.get('total_failure', 0)),
+    }
+    history = raw_stats.get('history') or []
+    now_ms = int(time.time() * 1000)
+    since_ms = now_ms - int(last_hour_secs * 1000) if last_hour_secs > 0 else 0
+
+    def _filter_since(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if since_ms <= 0:
+            return entries[:]
+        return [item for item in entries if item.get('ts', 0) >= since_ms]
+
+    ticker_events = [item for item in history if (item.get('type') or '').lower() == 'ticker']
+    order_events = [item for item in history if (item.get('type') or '').lower() == 'order']
+
+    ticker_success = sum(1 for item in ticker_events if item.get('success'))
+    ticker_failure = len(ticker_events) - ticker_success
+    order_success = sum(1 for item in order_events if item.get('success'))
+    order_failure = len(order_events) - order_success
+
+    ticker_last_hour = _filter_since(ticker_events)
+    order_last_hour = _filter_since(order_events)
+
+    ticker_last_hour_success = sum(1 for item in ticker_last_hour if item.get('success'))
+    ticker_last_hour_failure = len(ticker_last_hour) - ticker_last_hour_success
+    order_last_hour_success = sum(1 for item in order_last_hour if item.get('success'))
+    order_last_hour_failure = len(order_last_hour) - order_last_hour_success
+
+    if recent_limit > 0:
+        recent_ticker_events = ticker_events[-recent_limit:]
+    else:
+        recent_ticker_events = ticker_events[:]
+
+    return {
+        'total_success': totals['total_success'],
+        'total_failure': totals['total_failure'],
+        'ticker_success': ticker_success,
+        'ticker_failure': ticker_failure,
+        'order_success': order_success,
+        'order_failure': order_failure,
+        'last_hour_ticker_success': ticker_last_hour_success,
+        'last_hour_ticker_failure': ticker_last_hour_failure,
+        'last_hour_order_success': order_last_hour_success,
+        'last_hour_order_failure': order_last_hour_failure,
+        'recent_ticker_events': recent_ticker_events,
+    }
 
 
 class ExecHistoryStore:
@@ -111,9 +163,13 @@ class BaseWebsocketListener(abc.ABC):
         redis_client: Optional[Any] = None,
         log_name: str = "UpbitWSListener",
         log_file: str = "ws_listener.log",
+        stats_path: Path = WS_STATS_FILE,
+        ws_url: str = UPBIT_WS_URL,
     ):
         self.redis_client = redis_client
         self.logger = get_logger(name=log_name, log_file=log_file, level=logging.INFO)
+        self._stats_file = stats_path
+        self._ws_url = ws_url
         self._targets = _get_universe_targets()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -127,10 +183,16 @@ class BaseWebsocketListener(abc.ABC):
         self._stats_lock = threading.Lock()
         self._stats_totals = {"success": 0, "failure": 0}
         self._stats_history: deque[Dict[str, Any]] = deque(maxlen=self._stats_history_limit)
+        self.history_store = ExecHistoryStore()
+        self._entry_prices: Dict[str, float] = {}
         self._load_stats()
 
+    @property
+    def targets(self) -> List[str]:
+        return list(self._targets)
+
     def _load_stats(self) -> None:
-        stats = _load_ws_stats()
+        stats = _load_stats_from_path(self._stats_file)
         self._stats_totals["success"] = stats.get("total_success", 0)
         self._stats_totals["failure"] = stats.get("total_failure", 0)
         history_entries = stats.get("history", [])
@@ -138,8 +200,14 @@ class BaseWebsocketListener(abc.ABC):
 
     def _save_stats(self) -> None:
         try:
-            temp = WS_STATS_FILE.with_suffix(".tmp")
-            with temp.open("w", encoding="utf-8") as fp:
+            _ensure_history_dir()
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                delete=False,
+                dir=str(EXEC_HISTORY_DIR),
+                suffix=".tmp",
+            ) as fp:
                 json.dump(
                     {
                         "total_success": self._stats_totals["success"],
@@ -148,7 +216,7 @@ class BaseWebsocketListener(abc.ABC):
                     },
                     fp,
                 )
-            temp.replace(WS_STATS_FILE)
+            os.replace(fp.name, str(self._stats_file))
         except Exception as exc:
             self.logger.warning(f"Failed to save websocket stats: {exc}")
 
@@ -159,6 +227,7 @@ class BaseWebsocketListener(abc.ABC):
                     "ts": payload.get("trade_timestamp") or payload.get("timestamp") or int(time.time() * 1000),
                     "type": payload.get("type"),
                     "symbol": payload.get("code") or payload.get("symbol"),
+                    "trade_price": payload.get("trade_price") or payload.get("price"),
                     "success": success,
                 }
             )
@@ -300,6 +369,35 @@ class BaseWebsocketListener(abc.ABC):
         except Exception as exc:
             self.logger.warning(f"Redis write failed for websocket payload: {exc}")
 
+    def _record_exec_history(self, payload: Dict[str, Any]) -> None:
+        if payload.get("type") != "order":
+            return
+        ts = payload.get("timestamp") or payload.get("trade_timestamp") or int(time.time() * 1000)
+        entry = {
+            "ts": float(ts) / 1000.0 if isinstance(ts, (int, float)) else float(time.time()),
+            "symbol": payload.get("code") or payload.get("symbol"),
+            "price": payload.get("price") or payload.get("order_price") or 0,
+            "size": payload.get("trade_volume") or payload.get("volume") or 0,
+            "side": payload.get("side") or payload.get("order_side") or payload.get("ask_bid"),
+            "order_id": payload.get("uuid") or payload.get("order_id"),
+        }
+        side = (entry.get("side") or "").lower()
+        symbol = entry.get("symbol")
+        avg_price = payload.get("avg_price") or payload.get("avg_buy_price") or payload.get("order_price") or payload.get("price")
+        try:
+            avg_price_val = float(avg_price) if avg_price is not None else 0.0
+        except Exception:
+            avg_price_val = 0.0
+
+        entry_price_value = 0.0
+        if side in ("bid", "buy", "매수"):
+            self._entry_prices[symbol] = avg_price_val or self._entry_prices.get(symbol, 0.0)
+        else:
+            entry_price_value = self._entry_prices.get(symbol, avg_price_val)
+        entry["entry_price"] = entry_price_value or 0.0
+        if symbol:
+            self.history_store.record(entry)
+
     def _on_message(self, _, message: str) -> None:
         try:
             payloads = json.loads(message)
@@ -342,7 +440,7 @@ class BaseWebsocketListener(abc.ABC):
                 continue
             try:
                 ws_app = websocket.WebSocketApp(
-                    UPBIT_WS_URL,
+                    self._ws_url,
                     header=self.auth_headers() or None,
                     on_open=self._on_open,
                     on_message=self._on_message,
@@ -400,4 +498,3 @@ class BaseWebsocketListener(abc.ABC):
 
     def on_payload(self, payload: Dict[str, Any]) -> None:
         ...
-

@@ -80,11 +80,15 @@ class TradingBot:
     def _fetch_cached_klines(self, market: str, count: int):
         if self.redis_client is None:
             return []
-        key = f"ws:candles:{market}"
+        tf = getattr(self, 'timeframe', config.TIMEFRAME)
+        key = f"ws:candles:{tf}:{market}"
         try:
             raw = self.redis_client.lrange(key, 0, count - 1)
         except Exception as exc:
-            log.warning(f"Redis candle read failed for {market}: {exc}")
+            log.warning(f"Redis candle read failed for {key}: {exc}")
+            return []
+        if not raw:
+            log.warning(f"Redis cache miss for {key} (0 entries).")
             return []
         records = []
         for item in reversed(raw):

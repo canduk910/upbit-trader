@@ -19,6 +19,8 @@ services:
       dockerfile: Dockerfile.backend
     container_name: upbit-trader-backend
     working_dir: /app
+    env_file:
+      - server/.env
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
@@ -34,6 +36,9 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    volumes:
+      - ./runtime:/app/runtime
+      - ./logs:/app/logs
 
   ui:
     build:
@@ -41,6 +46,8 @@ services:
       dockerfile: Dockerfile.ui
     container_name: upbit-trader-ui
     working_dir: /app
+    env_file:
+      - server/.env
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
@@ -60,6 +67,8 @@ services:
       dockerfile: Dockerfile.bot
     container_name: upbit-trader-bot
     working_dir: /app
+    env_file:
+      - server/.env
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
@@ -70,6 +79,51 @@ services:
       backend:
         condition: service_started
     restart: unless-stopped
+    volumes:
+      - ./runtime:/app/runtime
+      - ./logs:/app/logs
+
+  ws_listener_public:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: upbit-trader-ws-listener-public
+    working_dir: /app
+    env_file:
+      - server/.env
+    command: ["python", "-m", "server.ws_listener_public"]
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./runtime:/app/runtime
+      - ./logs:/app/logs
+
+  ws_listener_private:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: upbit-trader-ws-listener-private
+    working_dir: /app
+    env_file:
+      - server/.env
+    command: ["python", "-m", "server.ws_listener_private"]
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./runtime:/app/runtime
+      - ./logs:/app/logs
 
 volumes:
   redis_data:

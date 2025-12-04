@@ -63,17 +63,20 @@ def setup_logger(name='UpbitBotLogger', log_file='trading_bot.log', level=loggin
     logger.addHandler(stream_handler)
 
     # 2. 파일(RotatingFile) 핸들러
-    # Ensure logs directory under project root exists and use it as default location
+    # Decide where to write logs; allow overriding via LOG_DIR for container-only placement
+    log_dir_env = os.environ.get('LOG_DIR')
     try:
         project_root = Path(__file__).resolve().parents[1]
     except Exception:
         project_root = Path(os.getcwd())
 
-    logs_dir = project_root / 'logs'
+    if log_dir_env:
+        logs_dir = Path(log_dir_env)
+    else:
+        logs_dir = project_root / 'logs'
     try:
         logs_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
-        # fallback to current working directory if creation fails
         logs_dir = Path(os.getcwd())
 
     # If log_file is an absolute path, keep it; otherwise place it under logs_dir

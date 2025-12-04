@@ -1,4 +1,9 @@
 import streamlit as st
+try:
+    from streamlit_autorefresh import st_autorefresh as _autorefresh_component
+except ImportError:
+    _autorefresh_component = None
+import sys
 # reload-test: touch ui file to verify backend reload behavior (do not remove)
 import requests
 from requests.adapters import HTTPAdapter
@@ -10,25 +15,14 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
 import os
-# Ensure process timezone is KST (Asia/Seoul) so Streamlit displays local times correctly
-os.environ.setdefault('TZ', 'Asia/Seoul')
-try:
-    time.tzset()
-except Exception:
-    # time.tzset may not be available on all platforms (Windows), ignore if unavailable
-    pass
 
-# Import configuration helpers from server package
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 try:
     from server.config import load_config, save_config as save_local
-except Exception:
-    # In case UI runs in an environment where server package isn't available on PYTHONPATH,
-    # fall back to a stub that will raise an informative error when used.
-    def load_config():
-        raise RuntimeError('server.config.load_config not available in PYTHONPATH')
-
-    def save_local(cfg):
-        raise RuntimeError('server.config.save_config not available in PYTHONPATH')
+except Exception as err:
+    raise RuntimeError(f'server.config.load_config import failed: {err}')
 
 
 def validate_config(cfg: Dict[str, Any]) -> Tuple[bool, str]:
@@ -96,18 +90,23 @@ def _safe_plotly_chart(fig, **kwargs):
 def _on_strategy_change():
     # mark change and request a rerun so Streamlit re-renders dynamic fields immediately
     st.session_state['_strategy_changed'] = True
-    try:
-        # prefer experimental_rerun compatibility
-        rerun = getattr(st, 'rerun', None) or getattr(st, 'experimental_rerun', None)
-        if rerun:
+    _trigger_rerun()
+
+
+def _trigger_rerun() -> None:
+    rerun = getattr(st, 'rerun', None) or getattr(st, 'experimental_rerun', None)
+    if rerun:
+        try:
             rerun()
-    except Exception:
-        pass
+        except Exception:
+            pass
 
 
 # API base URL for backend calls: read from env var STREAMLIT_API_BASE (set by docker-compose)
 # If not set, fall back to localhost for local development.
 API_BASE = os.getenv('STREAMLIT_API_BASE', 'http://127.0.0.1:8000')
+AUTO_REFRESH_KEY = 'ws_auto_refresh_enabled'
+
 
 # Create a requests session with retry/backoff to make UI-server comms more resilient
 def _build_session():
@@ -202,6 +201,37 @@ def _format_ws_trade_timestamp(payload: Dict[str, Any]) -> str:
         return pd.to_datetime(tsf, unit='s').strftime('%H:%M:%S')
     except Exception:
         return '-'
+
+
+def fetch_ws_ticker_data():
+    try:
+        resp = api_request('get', '/ws/ticker_data', timeout=5)
+        return resp.json(), None
+    except Exception as exc:
+        return None, exc
+
+
+def _render_autorefresh_button() -> bool:
+    enabled = st.session_state.get(AUTO_REFRESH_KEY, False)
+    status_label = 'ON' if enabled else 'OFF'
+    icon = '🟥' if enabled else '⚪'
+    label = f"{icon} 5초 자동 새로고침 ({status_label})"
+    clicked = st.button(label, key='ws_autorefresh_toggle', help='클릭하면 자동 새로고침을 켜거나 끕니다.')
+    if clicked:
+        enabled = not enabled
+        st.session_state[AUTO_REFRESH_KEY] = enabled
+        _trigger_rerun()
+    return enabled
+
+
+def _apply_autorefresh_if_enabled():
+    enabled = st.session_state.get(AUTO_REFRESH_KEY, False)
+    if not enabled:
+        return
+    if _autorefresh_component is None:
+        st.caption('streamlit-autorefresh 모듈이 없어 자동 갱신을 사용할 수 없습니다.')
+        return
+    _autorefresh_component(interval=5000, key='ws_ticker_autorefresh')
 
 
 # --- Upbit public klines helper (cached) ---
@@ -597,6 +627,33 @@ def render_ws_monitoring_page():
     else:
         st.info('WebSocket 통계를 불러올 수 없습니다. 리스너 실행 여부를 확인해 주세요.')
 
+    st.divider()
+    st.subheader('WebSocket 제어')
+    btn_col1, btn_col2, btn_col3 = st.columns(3)
+    with btn_col1:
+        if st.button('WebSocket 시작', key='ws_ctrl_start'):
+            try:
+                api_request('post', '/ws/start', timeout=5)
+                st.success('WebSocket 리스너 시작 요청이 전송되었습니다.')
+            except Exception as exc:
+                st.error(f'WebSocket 시작 실패: {exc}')
+    with btn_col2:
+        if st.button('WebSocket 중지', key='ws_ctrl_stop'):
+            try:
+                api_request('post', '/ws/stop', timeout=5)
+                st.success('WebSocket 리스너 중지 요청이 전송되었습니다.')
+            except Exception as exc:
+                st.error(f'WebSocket 중지 실패: {exc}')
+    with btn_col3:
+        if st.button('상태 새로 고침', key='ws_ctrl_refresh'):
+            _trigger_rerun()
+
+    st.divider()
+    enabled = st.session_state.get(AUTO_REFRESH_KEY, False)
+    enabled = _render_autorefresh_button()
+    st.session_state[AUTO_REFRESH_KEY] = enabled
+    _apply_autorefresh_if_enabled()
+
     st.subheader('분봉 수신 현황 (최근 10개)')
     rows = []
     if stats:
@@ -605,12 +662,41 @@ def render_ws_monitoring_page():
                 '시간': _format_ws_ts(item.get('ts')),
                 '종목': item.get('symbol') or '-',
                 '타입': item.get('type') or '-',
+                '현재가' : item.get('trade_price') or '-',
                 '결과': '성공' if item.get('success') else '실패',
             })
     if rows:
         _safe_dataframe(pd.DataFrame(rows), hide_index=True)
     else:
         st.info('최근 분봉 수신 기록이 없습니다.')
+
+    st.subheader('심볼별 최신 티커 정보 (5초 자동 갱신)')
+    ticker_data, ticker_err = fetch_ws_ticker_data()
+    if ticker_err:
+        st.warning(f'티커 데이터 조회 오류: {ticker_err}')
+    elif ticker_data and isinstance(ticker_data.get('tickers'), list):
+        df_tickers = pd.DataFrame(ticker_data['tickers'])
+        if not df_tickers.empty:
+            df_tickers = df_tickers.rename(columns={
+                'symbol': '심볼',
+                'opening_price': '시가',
+                'high_price': '고가',
+                'low_price': '저가',
+                'trade_price': '현재가',
+                'prev_closing_price': '전일종가',
+                'change': '전일대비변동',
+            })
+            if 'timestamp' in df_tickers.columns:
+                df_tickers['최근 수신'] = df_tickers['timestamp'].apply(_format_ws_ts)
+            display_cols = ['심볼', '시가', '고가', '저가', '현재가', '전일종가', '전일대비변동', '최근 수신']
+            available_cols = [c for c in display_cols if c in df_tickers.columns]
+            df_display = df_tickers[available_cols]
+            _safe_dataframe(df_display.fillna('-'), hide_index=True)
+        else:
+            st.info('티커 데이터가 아직 없습니다.')
+    else:
+        if ticker_err is None:
+            st.info('티커 데이터 로딩 대기 중입니다.')
 
     st.subheader('체결 수신 현황 (exec_history)')
     executions, exec_err = fetch_ws_executions()
@@ -1189,69 +1275,6 @@ def render_watcher_page(cfg: Dict[str, Any]):
                 st.error(f'Watcher 중지 오류: {e}')
 
     st.divider()
-    st.subheader('WebSocket 스트리밍 상태')
-    ws_status_msg, ws_status_err = fetch_ws_status()
-    ws_running = False
-    ws_targets = []
-    if ws_status_msg:
-        ws_running = ws_status_msg.get('running', False)
-        ws_targets = ws_status_msg.get('targets') or []
-    if ws_status_err:
-        st.warning(f'WebSocket 상태를 가져오는 중 오류: {ws_status_err}')
-    st.markdown(
-        f"- 상태: {'실행 중' if ws_running else '대기 중'}  \
-- 구독 종목 수: {len(ws_targets)}"
-    )
-    ws_col1, ws_col2, ws_col3 = st.columns(3)
-    with ws_col1:
-        if st.button('WebSocket 시작', key='ws_btn_start'):
-            try:
-                api_request('post', '/ws/start', timeout=5)
-                st.success('WebSocket 리스너 시작 요청이 전송되었습니다.')
-            except Exception as exc:
-                st.error(f'WebSocket 시작 실패: {exc}')
-    with ws_col2:
-        if st.button('WebSocket 중지', key='ws_btn_stop'):
-            try:
-                api_request('post', '/ws/stop', timeout=5)
-                st.success('WebSocket 리스너 중지 요청이 전송되었습니다.')
-            except Exception as exc:
-                st.error(f'WebSocket 중지 실패: {exc}')
-    with ws_col3:
-        if st.button('상태 새로 고침', key='ws_btn_refresh'):
-            st.experimental_rerun()
-
-    st.caption('WebSocket은 Redis 및 exec_history.json에 실시간 데이터를 저장하며, UI는 Redis의 최근 체결을 표시합니다.')
-    selected_symbol = None
-    if ws_targets:
-        if 'ws_selected_symbol' not in st.session_state or st.session_state['ws_selected_symbol'] not in ws_targets:
-            st.session_state['ws_selected_symbol'] = ws_targets[0]
-        selected_symbol = st.selectbox('최근 체결을 볼 종목', ws_targets, key='ws_symbol_selector')
-    else:
-        selected_symbol = st.text_input('조회할 종목을 입력하세요', value='KRW-BTC')
-
-    trades_data, trades_err = fetch_ws_trades(selected_symbol, limit=10) if selected_symbol else (None, None)
-    if trades_err:
-        st.warning(f'실시간 체결을 가져오는 중 오류: {trades_err}')
-    elif trades_data and trades_data.get('trades'):
-        trades = trades_data['trades']
-        formatted = []
-        for trade in trades:
-            formatted.append({
-                '시간': _format_ws_trade_timestamp(trade),
-                '가격': f"{float(trade.get('trade_price', trade.get('price', 0)) or 0):,.0f}",
-                '거래량': f"{float(trade.get('trade_volume', trade.get('volume', 0)) or 0):,.4f}",
-                '방향': trade.get('ask_bid') or trade.get('side') or '-',
-            })
-        try:
-            dfs = pd.DataFrame(formatted)
-            _safe_dataframe(dfs)
-        except Exception:
-            st.write(formatted)
-    else:
-        st.info('선택한 종목의 최근 체결이 아직 없습니다. WebSocket 리스너가 실행 중인지 확인하세요.')
-
-    # Show recent watcher status if available
     try:
         resp = api_request('get', '/watcher/status', timeout=5)
         if resp and resp.status_code == 200:
