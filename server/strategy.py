@@ -101,34 +101,51 @@ class RSIStrategy(Strategy):
 # - k 값은 0과 1 사이의 값으로 설정 (일반적으로 0.4~0.6 권장)
 # - generate_signals() 메서드 구현
 #   - 캔들 데이터프레임을 입력받아 매수 신호 생성
-#   - 'BUY', 'HOLD' 중 하나 반환 (매도 신호는 별도 전략 필요)
+#   - 'BUY', 'SELL', 'HOLD'
+#   - 'SELL' 신호는 실패한 돌파, ATR 손절, 트레일링 스톱, 시간 기반 청산 조건에 따라 생성
 # - 로그에 목표가 및 신호 출력
 # - 예외 처리 포함
 class VolatilityBreakoutStrategy(Strategy):
 
-    # 초기화 메서드
-    def __init__(self, k=0.5):
+     # 초기화 메서드
+    def __init__(self, k=0.5, atr_period=14, atr_multiplier=1.5, trailing_window=5, failed_breakout_lookback=3):
         self.k = k # 변동성 돌파 계수
+        self.atr_period = atr_period
+        self.atr_multiplier = atr_multiplier
+        self.trailing_window = trailing_window
+        self.failed_breakout_lookback = failed_breakout_lookback
         if not 0 < k < 1: # k 값 유효성 검사
             log.warning(f"k value {k} is unusual. It's typically between 0.4 and 0.6.")
+
+    # ATR 계산 메서드
+    # :param klines_df: 업비트 캔들 데이터프레임
+    # :return: (pd.Series) ATR 지표
+    # 내부 사용 메서드
+    def _calculate_atr(self, klines_df: pd.DataFrame):
+        try:
+            indicator = ta.volatility.AverageTrueRange(
+                high=klines_df['high_price'],
+                low=klines_df['low_price'],
+                close=klines_df['trade_price'],
+                window=self.atr_period,
+            )
+            return indicator.average_true_range()
+        except Exception as exc:
+            log.warning(f"ATR calculation failed: {exc}")
+            return pd.Series([float('nan')] * len(klines_df))
 
     # 매매 신호 생성 메서드
     # :param klines_df: 캔들 데이터프레임
     # :return: (str) 'BUY', 'HOLD'
     # 구현된 메서드
-    # 내부적으로 전일 고가, 저가, 당일 시가를 사용하여 목표가 계산
-    # 당일 고가가 목표가를 돌파하면 매수 신호 생성
-    # 로그에 신호 및 목표가 출력
     def generate_signals(self, klines_df):
-        # 최소 2일치 데이터 필요
-        if len(klines_df) < 2:
-            log.warning("Volatility breakout strategy requires at least 2 days of data.")
-            return 'HOLD'
+        df = klines_df.copy().reset_index(drop=True)
+        df['atr'] = self._calculate_atr(df)
 
         # 변동성 돌파 목표가 계산
         try:
-            prev_day = klines_df.iloc[-2]   # 전일 데이터
-            today = klines_df.iloc[-1]      # 당일 데이터
+            prev_day = df.iloc[-2]   # 전일 데이터
+            today = df.iloc[-1]      # 당일 데이터
 
             # 변동폭 = 전일 고가 - 전일 저가
             volatility_range = prev_day['high_price'] - prev_day['low_price']
@@ -142,6 +159,39 @@ class VolatilityBreakoutStrategy(Strategy):
             if today['high_price'] >= target_price:
                 log.info(f"Price broke the target price ({target_price:.2f}). Signal: BUY")
                 return 'BUY'
+
+            sell_reasons = []
+            # Failed breakout: 돌파 시도 후 종가가 전일 고가 아래
+            if today['high_price'] >= prev_day['high_price'] and today['trade_price'] < prev_day['high_price']:
+                sell_reasons.append('Failed breakout (close below previous high)')
+
+            """
+            # ATR 기반 손절 (고정 손절 개념)
+            atr_value = float(df['atr'].iloc[-1]) if not pd.isna(df['atr'].iloc[-1]) else None
+            if atr_value:
+                atr_stop = today['opening_price'] - atr_value * self.atr_multiplier
+                if today['trade_price'] <= atr_stop:
+                    sell_reasons.append('ATR stop hit')
+
+                # Trailing stop: 최근 고가 - ATR * multiplier
+                recent_high = df['high_price'].rolling(self.trailing_window).max().iloc[-1]
+                trailing_stop = recent_high - atr_value * self.atr_multiplier
+                if today['trade_price'] <= trailing_stop:
+                    sell_reasons.append('Trailing ATR stop hit')
+            """
+            # 돌파 캔들 저가 이탈 or 전일 저가 이탈 시 추세 종료로 간주
+            if today['low_price'] <= prev_day['low_price']:
+                sell_reasons.append('Previous low breached')
+
+            # 일정 기간 동안 전고점 갱신 실패 시 시간 기반 청산
+            lookback = min(len(df), self.failed_breakout_lookback)
+            recent_highs = df['high_price'].iloc[-lookback:]
+            if len(recent_highs) >= 2 and recent_highs.max() <= prev_day['high_price'] and today['trade_price'] <= prev_day['high_price']:
+                sell_reasons.append('Time stop: no new highs')
+
+            if sell_reasons:
+                log.info(f"Volatility breakout SELL signal: {', '.join(sell_reasons)}")
+                return 'SELL'
 
         except Exception as e:
             log.error(f"Error in VolatilityBreakoutStrategy: {e}")

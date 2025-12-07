@@ -9,12 +9,13 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
 import os
+import json
 
 project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
@@ -167,12 +168,12 @@ def _format_ws_ts(ts: Any) -> str:
         return '-'
     if value > 1e12:
         value /= 1000.0
-    ts = pd.to_datetime(value, unit='s', utc=True)
+    dt = pd.to_datetime(value, unit='s', utc=True)
     try:
-        ts = ts.tz_convert('Asia/Seoul')
+        dt = dt.tz_convert('Asia/Seoul')
     except Exception:
-        ts = ts.tz_localize('Asia/Seoul', ambiguous='NaT', nonexistent='shift_forward')
-    return ts.strftime('%Y-%m-%d %H:%M:%S')
+        dt = dt.tz_localize('Asia/Seoul', ambiguous='NaT', nonexistent='shift_forward')
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
 
 
 def fetch_ws_stats(last_hour_sec: int = 3600, recent_limit: int = 10):
@@ -406,6 +407,8 @@ def plot_candles_with_indicators(df: pd.DataFrame, ticker: str, ma_windows: list
         colors = ['red' if c >= o else 'blue' for o, c in zip(df['open'], df['close'])]
     except Exception:
         colors = 'gray'
+    if 'volume' not in df.columns:
+        df['volume'] = 0
     fig.add_trace(go.Bar(x=df['time'], y=df['volume'], name='Volume', marker=dict(color=colors), hovertemplate='Volume: %{y:,.0f}<extra></extra>'), row=2, col=1)
     # Keep volume axis independent
     fig.update_yaxes(title_text='Volume', row=2, col=1)
@@ -460,6 +463,8 @@ def render_config_page(cfg: Dict[str, Any]):
         elif strategy_name == 'VolatilityBreakout':
             vb = strategy_params.get('VolatilityBreakout', {})
             k_value = st.number_input('변동성 비율 k (0~1)', min_value=0.0, max_value=1.0, value=float(vb.get('k_value', 0.5)), help='지난 기간의 변동성에서 몇 퍼센트만큼 돌파를 보면 진입할지 정하는 수치예요. 0.5가 보통 사용됩니다.')
+            target_vol_pct_default = vb.get('target_vol_pct', cfg.get('vb_target_vol_pct', 30.0))
+            target_vol_pct = st.number_input('목표 변동성 비율 (%)', min_value=1.0, max_value=100.0, value=float(target_vol_pct_default), help='시장 변동성이 이 값 이상인지 보고 매매 여부를 판단해요.')
         elif strategy_name == 'DualMomentum':
             dm = strategy_params.get('DualMomentum', {})
             window = st.number_input('모멘텀 계산 창 길이', min_value=1, value=int(dm.get('window', 12)), help='모멘텀을 계산할 때 몇 기간을 볼지 정해요. 숫자가 크면 더 긴 흐름을 봐요.')
@@ -544,7 +549,10 @@ def render_config_page(cfg: Dict[str, Any]):
             'overbought': rsi_overbought,
         }
     elif strategy_name == 'VolatilityBreakout':
-        new_cfg['strategy_params']['VolatilityBreakout'] = {'k_value': k_value}
+        new_cfg['strategy_params']['VolatilityBreakout'] = {
+            'k_value': k_value,
+            'target_vol_pct': target_vol_pct,
+        }
     elif strategy_name == 'DualMomentum':
         new_cfg['strategy_params']['DualMomentum'] = {'window': window}
 
@@ -1240,48 +1248,276 @@ def render_positions_page():
         st.error(f'포지션 표시 중 오류: {e}')
 
 
-def render_watcher_page(cfg: Dict[str, Any]):
-    st.title('이벤트 감시자 관리')
-    st.write('백엔드의 이벤트 감시자(Watcher)를 시작/중지할 수 있습니다. 웹소켓 대신 폴링 기반으로 동작하도록 구성할 수 있어요.')
-
-    watch_market = st.text_input('감시할 마켓', value=cfg.get('market', 'KRW-BTC'))
-    watch_interval = st.number_input('체크 간격(초)', min_value=0.1, value=float(cfg.get('watch_interval', 1.0)))
-    vol_k = float(cfg.get('strategy_params', {}).get('VolatilityBreakout', {}).get('k_value', 0.5))
-    cb_vol_k = st.slider('변동성 K 값', min_value=0.0, max_value=1.0, value=vol_k)
-    cb_vol_mul = st.number_input('거래량 폭증 배수', min_value=1, value=int(cfg.get('vol_spike_multiplier', 3)))
-
-    colx, coly = st.columns(2)
-    with colx:
-        if st.button('Watcher 시작'):
-            payload = {
-                'market': watch_market,
-                'interval': float(watch_interval),
-                'callbacks': [
-                    {'type': 'volatility_breakout', 'k': float(cb_vol_k)},
-                    {'type': 'volume_spike', 'multiplier': int(cb_vol_mul)},
-                ]
-            }
-            try:
-                resp = api_request('post', '/watcher/start', json=payload, timeout=10)
-                st.success('Watcher 시작 요청을 보냈습니다.')
-            except Exception as e:
-                st.error(f'Watcher 시작 오류: {e}')
-    with coly:
-        if st.button('Watcher 중지'):
-            try:
-                resp = api_request('post', '/watcher/stop', timeout=10)
-                st.success('Watcher 중지 요청을 보냈습니다.')
-            except Exception as e:
-                st.error(f'Watcher 중지 오류: {e}')
-
-    st.divider()
+def fetch_ai_history(limit: int = 100):
     try:
-        resp = api_request('get', '/watcher/status', timeout=5)
-        if resp and resp.status_code == 200:
-            st.subheader('Watcher 상태')
-            st.json(resp.json())
+        resp = api_request('get', '/ai/history', params={'limit': limit}, timeout=10)
+        return resp.json(), None
+    except Exception as exc:
+        return None, exc
+
+
+def fetch_bot_status():
+    try:
+        resp = api_request('get', '/bot/status', timeout=5)
+        return resp.json(), None
+    except Exception as exc:
+        return None, exc
+
+
+def update_bot_control_api(enabled: Optional[bool] = None, interval_sec: Optional[float] = None):
+    payload = {}
+    if enabled is not None:
+        payload['enabled'] = enabled
+    if interval_sec is not None:
+        payload['interval_sec'] = interval_sec
+    if not payload:
+        return None, RuntimeError('enabled 또는 interval_sec 중 하나가 필요합니다.')
+    try:
+        resp = api_request('post', '/bot/control', json=payload, timeout=10)
+        return resp.json(), None
+    except Exception as exc:
+        return None, exc
+
+
+def render_bot_control_page():
+    st.title('자동매매봇 관리')
+    st.write('서버의 trading_bot 실행 여부, 검사 주기 등을 바꿀 수 있는 제어 화면입니다.')
+    status, err = fetch_bot_status()
+    if err:
+        st.error(f'봇 상태 조회 실패: {err}')
+        status = {}
+    enabled = bool(status.get('bot_enabled'))
+    interval = float(status.get('bot_interval_sec', cfg.get('loop_interval_sec', 5)))
+    st.metric('자동매매 허용', '활성' if enabled else '중지됨')
+    st.metric('검사 주기(초)', f'{interval:.1f}')
+
+    with st.form('bot_control_form'):
+        desired_interval = st.number_input('리플레이 주기 (초)', min_value=0.5, value=interval, step=0.5)
+        col1, col2, col3 = st.columns(3)
+        start = col1.form_submit_button('봇 시작')
+        stop = col2.form_submit_button('봇 중지')
+        update = col3.form_submit_button('주기 저장')
+        if start:
+            _, err = update_bot_control_api(enabled=True, interval_sec=desired_interval)
+            if err:
+                st.error(f'시작 실패: {err}')
+            else:
+                st.success('봇 시작 요청 완료')
+                _trigger_rerun()
+        if stop:
+            _, err = update_bot_control_api(enabled=False)
+            if err:
+                st.error(f'중지 실패: {err}')
+            else:
+                st.warning('봇 정지 요청 완료')
+                _trigger_rerun()
+        if update:
+            _, err = update_bot_control_api(interval_sec=desired_interval)
+            if err:
+                st.error(f'주기 업데이트 실패: {err}')
+            else:
+                st.success('주기를 저장했습니다.')
+                _trigger_rerun()
+
+    st.caption('설정을 바꾼 이후에는 trading_bot 또는 config 재로딩을 확인하세요.')
+
+
+def render_ai_report_page():
+    st.title('AI 자문 리포트')
+    st.caption('OpenAI와 Gemini가 내린 최신 자문 결과를 한눈에 확인합니다.')
+
+    history_payload, history_err = fetch_ai_history(limit=100)
+    if history_err:
+        st.error(f'AI 자문 이력 조회 실패: {history_err}')
+        return
+
+    items = history_payload.get('items') if isinstance(history_payload, dict) else None
+    if not items:
+        st.info('AI 자문 이력이 아직 없습니다. 봇을 실행해 기록을 쌓아주세요.')
+        return
+
+    latest = items[-1]
+    openai_payload = _get_ai_source_payload(latest, 'openai')
+    gemini_payload = _get_ai_source_payload(latest, 'gemini')
+    latest_ts = _format_ts_kst(latest.get('ts'))
+    st.subheader(f'1) 최신 자문 비교 (생성: {latest_ts})')
+    latest_cols = st.columns(2, gap='large')
+
+    def _render_model_card(col, label: str, payload: Dict[str, Any] | None):
+        with col:
+            st.markdown(f"### {label}")
+            if not payload:
+                st.info('데이터 없음')
+                return
+            decision = payload.get('decision') or payload.get('action') or 'N/A'
+            st.metric('결정', decision)
+            confidence = _get_ai_confidence(payload)
+            conf_str = _format_confidence(confidence)
+            if conf_str != '-':
+                st.caption(f"신뢰도: {conf_str}")
+            st.caption(f"모델: {payload.get('model', '-')}")
+            reasoning = payload.get('reason') or payload.get('reasoning')
+            if reasoning:
+                st.write(reasoning)
+            with st.expander('원문 JSON 보기', expanded=False):
+                st.json(payload)
+
+    _render_model_card(latest_cols[0], 'OpenAI', openai_payload)
+    _render_model_card(latest_cols[1], 'Gemini', gemini_payload)
+
+    st.subheader('2) 입력 캔들 차트')
+    chart_df = _prepare_ai_chart_df(latest)
+    if chart_df is None or chart_df.empty:
+        st.info('차트 데이터가 없습니다. 마지막 기록에서는 `klines` 필드가 비어 있으므로 차트를 그릴 수 없습니다. `runtime/history/ai_decisions.json`을 확인해서 실제 캔들 데이터를 포함하도록 봇 설정을 조정하세요.')
+    else:
+        chart_fig = plot_candles_with_indicators(chart_df, cfg.get('market', 'KRW-BTC'), ma_windows=[20, 60], rsi_period=14)
+        chart_fig.update_layout(height=520)
+        _safe_plotly_chart(chart_fig)
+
+    st.subheader('3) 입력 전문')
+    with st.expander('입력 JSON', expanded=False):
+        context_payload = latest.get('context') or {}
+        if isinstance(context_payload, str):
+            context_payload = _parse_json_field(context_payload)
+        st.json(context_payload)
+
+    st.subheader('4) 자문 히스토리')
+    history_rows = []
+    for item in reversed(items):
+        history_openai = _get_ai_source_payload(item, 'openai')
+        history_gemini = _get_ai_source_payload(item, 'gemini')
+        history_rows.append({
+            '시각(KST)': _format_ts_kst(item.get('ts')),
+            '최종 결정': item.get('decision'),
+            '사유': item.get('reason'),
+            'OpenAI': history_openai.get('decision') if history_openai else '-',
+            'OpenAI 신뢰도': _format_confidence(_get_ai_confidence(history_openai)) if history_openai else '-',
+            'Gemini': history_gemini.get('decision') if history_gemini else '-',
+            'Gemini 신뢰도': _format_confidence(_get_ai_confidence(history_gemini)) if history_gemini else '-',
+        })
+    df_history = pd.DataFrame(history_rows)
+    _safe_dataframe(df_history.fillna('-'), hide_index=True)
+
+
+def _format_confidence(value: Any) -> str:
+    if value is None:
+        return '-'
+    try:
+        val = float(value)
     except Exception:
-        pass
+        return str(value)
+    if val > 1:
+        return f"{val:.1f}%"
+    return f"{val * 100:.1f}%"
+
+
+def _format_ts_kst(ts: Any) -> str:
+    if ts is None:
+        return '-'
+    try:
+        value = float(ts)
+    except Exception:
+        return '-'
+    if value > 1e12:
+        value /= 1000.0
+    dt = pd.to_datetime(value, unit='s', utc=True)
+    try:
+        dt = dt.tz_convert('Asia/Seoul')
+    except Exception:
+        dt = dt.tz_localize('Asia/Seoul', ambiguous='NaT', nonexistent='shift_forward')
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _parse_json_field(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+    return value
+
+
+def _get_ai_source_payload(entry: Dict[str, Any], provider: str) -> Optional[Dict[str, Any]]:
+    payload = entry.get(provider)
+    if isinstance(payload, dict):
+        return payload
+    sources = entry.get('ai_sources') or {}
+    return sources.get(provider) if isinstance(sources, dict) else None
+
+
+def _get_ai_confidence(payload: Any) -> Optional[float]:
+    if payload is None:
+        return None
+    if isinstance(payload, dict) and payload.get('confidence') is not None:
+        return payload.get('confidence')
+    if isinstance(payload, dict):
+        raw = payload.get('raw')
+        if raw is not None:
+            conf = _get_ai_confidence(raw)
+            if conf is not None:
+                return conf
+    if isinstance(payload, dict):
+        for value in payload.values():
+            conf = _get_ai_confidence(value)
+            if conf is not None:
+                return conf
+    if isinstance(payload, list):
+        for item in payload:
+            conf = _get_ai_confidence(item)
+            if conf is not None:
+                return conf
+    return None
+
+
+def _prepare_ai_chart_df(entry: Dict[str, Any]) -> pd.DataFrame | None:
+    klines = entry.get('klines')
+    if isinstance(klines, str):
+        klines = _parse_json_field(klines)
+    if not klines:
+        context = entry.get('context') or {}
+        if isinstance(context, str):
+            context = _parse_json_field(context) or {}
+        markets = isinstance(context, dict) and context.get('markets') or []
+        if markets:
+            market = markets[0]
+            timeframe = market.get('timeframes', {})
+            for tf_cfg in timeframe.values():
+                candles = tf_cfg.get('candles') or tf_cfg.get('history') or tf_cfg.get('klines')
+                if candles:
+                    klines = candles
+                    break
+        if not klines:
+            return None
+    try:
+        df = pd.DataFrame(klines)
+    except Exception:
+        return None
+    rename_map = {
+        't': 'time',
+        'candle_date_time_kst': 'time',
+        'trade_price': 'close',
+        'opening_price': 'open',
+        'high_price': 'high',
+        'low_price': 'low',
+        'volume': 'volume',
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    if 'time' not in df.columns:
+        return None
+    try:
+        df['time'] = pd.to_datetime(df['time'])
+    except Exception:
+        try:
+            df['time'] = pd.to_datetime(df['time'].astype(str))
+        except Exception:
+            return None
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    df = df.sort_values('time').dropna(subset=['time']).reset_index(drop=True)
+    if df.empty:
+        return None
+    return df
 
 
 # --- Main app logic ---
@@ -1294,7 +1530,8 @@ sb.caption('원하는 기능으로 바로 가기')
 NAV_OPTIONS = [
     'WebSocket 모니터링',
     '종목스크리닝',
-    '이벤트 감시자 관리',
+    'AI 자문 리포트',
+    '자동매매봇 관리',
     '원화잔고 및 포지션 분석',
     '설정 편집',
 ]
@@ -1341,8 +1578,8 @@ if page == 'WebSocket 모니터링':
     render_ws_monitoring_page()
 elif page == '종목스크리닝':
     render_screening_page()
-elif page == '이벤트 감시자 관리':
-    render_watcher_page(cfg)
+elif page == 'AI 자문 리포트':
+    render_ai_report_page()
 elif page == '원화잔고 및 포지션 분석':
     try:
         render_positions_page()
@@ -1350,3 +1587,5 @@ elif page == '원화잔고 및 포지션 분석':
         st.error(f'원화잔고/포지션 페이지 렌더링 중 오류: {e}')
 elif page == '설정 편집':
     render_config_page(cfg)
+elif page == '자동매매봇 관리':
+    render_bot_control_page()

@@ -4,6 +4,7 @@ import hashlib
 from urllib.parse import urlencode
 import requests
 import time
+from typing import Optional
 from server.logger import log
 try:
     import pyupbit
@@ -229,3 +230,40 @@ class UpbitAPI:
                     return records
             except Exception as e:
                 log.warning(f'pyupbit get_klines failed, falling back to HTTP: {e}')
+
+        params = {'market': market, 'count': count}
+        return self._send_request('GET', endpoint, params=params)
+
+    def get_orderbook(self, markets):
+        if isinstance(markets, (list, tuple)):
+            market_param = ','.join(markets)
+        else:
+            market_param = markets
+        data = self._send_request('GET', '/v1/orderbook', params={'markets': market_param})
+        if data and isinstance(data, list):
+            return data
+        return None
+
+    def place_order(self, market: str, side: str, ord_type: str = 'price', price: Optional[float] = None, volume: Optional[float] = None):
+        payload = {
+            'market': market,
+            'side': side,
+            'ord_type': ord_type,
+        }
+        if ord_type == 'price':
+            if price is None:
+                raise ValueError('price is required for ord_type="price"')
+            payload['price'] = price
+        elif ord_type == 'market':
+            if volume is None:
+                raise ValueError("volume is required for market sell (ord_type='market')")
+            payload["volume"] = str(volume)
+        elif ord_type == 'limit':
+            if price is None or volume is None:
+                raise ValueError('price and volume are required for ord_type="limit"')
+            payload['price'] = price
+            payload['volume'] = volume
+        else:
+            raise ValueError(f"Unsupported ord_type: {ord_type}")
+
+        return self._send_request('POST', '/v1/orders', data=payload)

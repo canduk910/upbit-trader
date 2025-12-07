@@ -40,12 +40,20 @@ class DedupFilter(logging.Filter):
             self._last[key] = now
             return True
 
+LOG_LEVEL_NAME = os.environ.get('LOG_LEVEL', '').strip().upper()
+try:
+    LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME) if LOG_LEVEL_NAME else logging.INFO
+except AttributeError:
+    LOG_LEVEL = logging.INFO
+
+
 def setup_logger(name='UpbitBotLogger', log_file='trading_bot.log', level=logging.INFO):
     """
     로그 설정
     """
     logger = logging.getLogger(name)
-    logger.setLevel(level)
+    configured_level = LOG_LEVEL if LOG_LEVEL_NAME else level
+    logger.setLevel(configured_level)
 
     # 이미 핸들러가 설정되어 있으면 중복 추가 방지
     if logger.hasHandlers():
@@ -98,8 +106,9 @@ def setup_logger(name='UpbitBotLogger', log_file='trading_bot.log', level=loggin
         window = float(os.environ.get('LOG_DEDUP_WINDOW', '2.0'))
     except Exception:
         window = 2.0
-    dedup = DedupFilter(window_seconds=window)
-    logger.addFilter(dedup)
+    if window > 0:
+        dedup = DedupFilter(window_seconds=window)
+        logger.addFilter(dedup)
 
     # Detect stray log files named 'trading_bot.log' outside the canonical logs directory.
     try:

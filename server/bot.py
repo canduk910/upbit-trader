@@ -6,9 +6,11 @@ import redis
 import ta
 from server.upbit_api import UpbitAPI
 from server.strategy import RSIStrategy, VolatilityBreakoutStrategy, DualMomentumStrategy
-from server.money_manager import KellyCriterionManager
-import server.config as config
 from server.logger import log
+from server.money_manager import KellyCriterionManager
+from server.order_executor import OrderExecutor, OrderRequest
+from server.history import ai_history_store
+import server.config as config
 
 # ai analyzer may be optional; import if available
 try:
@@ -45,6 +47,12 @@ class TradingBot:
 
         # redis client for candle cache access
         self.redis_client = self._init_redis_client()
+        self.order_executor = OrderExecutor(self.api)
+        self.order_executor.start()
+        self._bot_paused_logged = False
+        self._last_ai_result = None
+        self._last_sell_timestamp = 0.0
+        self._last_size_plan = None
 
         # 3. 초기 자산 상태 확인
         self.in_position = self.check_initial_position()
@@ -65,6 +73,9 @@ class TradingBot:
         self.candle_count = config.CANDLE_COUNT
         self.loop_interval = config.LOOP_INTERVAL_SEC
         self.trade_amount_krw = config.TRADE_AMOUNT_KRW
+        self.bot_interval = float(getattr(config, 'BOT_INTERVAL_SEC', self.loop_interval))
+        self.bot_enabled = bool(getattr(config, 'BOT_ENABLED', True))
+        self.sell_cooldown = float(getattr(config, 'BOT_SELL_COOLDOWN_SEC', 120.0))
 
     def _init_redis_client(self):
         url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -76,6 +87,13 @@ class TradingBot:
         except Exception as exc:
             log.warning(f"Failed to connect to Redis ({url}): {exc}")
             return None
+
+    def _sell_on_cooldown(self) -> bool:
+        if not self.sell_cooldown:
+            return False
+        if self._last_sell_timestamp <= 0:
+            return False
+        return time.time() - self._last_sell_timestamp < self.sell_cooldown
 
     def _fetch_cached_klines(self, market: str, count: int):
         if self.redis_client is None:
@@ -331,17 +349,34 @@ class TradingBot:
         orderbook = None
         if 'pyupbit' in globals() and pyupbit is not None:
             try:
-                ob_list = pyupbit.get_orderbook(tickers=symbol) # 리스트 반환
+                # pyupbit.get_orderbook 은 ticker 인자를 사용함
+                ob_list = pyupbit.get_orderbook(ticker=symbol)
                 if ob_list:
                     ob = ob_list[0]
-                    units = ob.get('orderbook_units', [])[:5]  # 상위 5호가까지만
-                    bids = [{'price': u['bid_price'], 'size': u['bid_size']} for u in units] # 매수호가
-                    asks = [{'price': u['ask_price'], 'size': u['ask_size']} for u in units] # 매도호가
+                    units = ob.get('orderbook_units', [])[:5]
+                    bids = [{'price': u['bid_price'], 'size': u['bid_size']} for u in units]
+                    asks = [{'price': u['ask_price'], 'size': u['ask_size']} for u in units]
                     orderbook = {
                         'timestamp': ob.get('timestamp'),
                         'bids': bids,
                         'asks': asks,
                     }
+            except TypeError:
+                # 일부 pyupbit 버전은 positional arg만 허용
+                try:
+                    ob_list = pyupbit.get_orderbook(symbol)
+                    if ob_list:
+                        ob = ob_list[0]
+                        units = ob.get('orderbook_units', [])[:5]
+                        bids = [{'price': u['bid_price'], 'size': u['bid_size']} for u in units]
+                        asks = [{'price': u['ask_price'], 'size': u['ask_size']} for u in units]
+                        orderbook = {
+                            'timestamp': ob.get('timestamp'),
+                            'bids': bids,
+                            'asks': asks,
+                        }
+                except Exception as inner_e:
+                    log.warning(f'Failed to fetch orderbook for AI context (fallback): {inner_e}')
             except Exception as e:
                 log.warning(f'Failed to fetch orderbook for AI context: {e}')
 
@@ -442,6 +477,18 @@ class TradingBot:
                 # detect runtime config changes and reload if needed
                 self._detect_and_reload_config() # 설정 변경 감지 및 재로드
 
+                # Pause loop when bot disabled via config
+                if not getattr(config, 'BOT_ENABLED', True):
+                    if not self._bot_paused_logged:
+                        log.info("Trading bot paused via config. Waiting for re-enable...")
+                        self._bot_paused_logged = True
+                    time.sleep(self.bot_interval)
+                    continue
+                else:
+                    if self._bot_paused_logged:
+                        log.info("Trading bot re-enabled. Resuming loop.")
+                        self._bot_paused_logged = False
+
                 # 1. 시세 데이터 조회
                 klines = self._fetch_cached_klines(self.market, self.candle_count)
                 if not klines:
@@ -458,48 +505,122 @@ class TradingBot:
                 technical_signal = self.strategy.generate_signals(raw_df)
 
                 final_decision = 'HOLD' # 기본 결정은 HOLD
+                event_reason = '조건 미달'
+                ai_payload = None
+                config_info = {
+                    'strategy': config.STRATEGY_NAME,
+                    'market': self.market,
+                    'loop_interval': self.loop_interval,
+                    'min_order': config.MIN_ORDER_AMOUNT,
+                    'trade_amount': self.trade_amount_krw,
+                    'kelly': config.USE_KELLY_CRITERION,
+                    'timeframe': self.timeframe,
+                    'candle_count': self.candle_count,
+                }
+                try:
+                    volatility_range = raw_df['high_price'].max() - raw_df['low_price'].min()
+                    mean_price = raw_df['trade_price'].mean()
+                    current_vol_pct = (volatility_range / mean_price * 100.0) if mean_price else None
+                    config_info['current_vol_pct'] = current_vol_pct
+                    config_info['reference_vol_pct'] = float(getattr(config, 'VB_TARGET_VOL_PCT', 30.0))
+                except Exception:
+                    config_info['current_vol_pct'] = None
+                    config_info['reference_vol_pct'] = float(getattr(config, 'VB_TARGET_VOL_PCT', 30.0))
 
                 # 3. AI 분석 및 최종 매매 결정
+                # 기술적신호 상 신호를 받아 AI에게 자문한다.
                 # 매수 신호 처리
                 if technical_signal == 'BUY' and not self.in_position:
                     log.info(f"🚀 Technical Signal [BUY] detected! Asking AI Ensemble for confirmation...")
-                    trading_context = self.build_trading_context(klines) # TradingContext 구성
-                    ai_decision = None
-                    if self.ai:
-                        try:
-                            ai_decision = self.ai.analyze(trading_context) # AI 분석
-                        except Exception as e:
-                            log.warning(f"AI analysis failed: {e}")
 
-                    # AI가 BUY 권고하거나 AI가 없을 때 기술신호만으로 BUY 결정
-                    if ai_decision == 'BUY' or (self.ai is None and technical_signal == 'BUY'):
-                        final_decision = 'BUY'
-                        log.info("✅ Decision: BUY")
-                    else:
-                        log.info(f"❌ AI Ensemble REJECTED the BUY signal (AI said: {ai_decision}). Holding.")
-
-                # 매도 신호 처리
-                elif technical_signal == 'SELL' and self.in_position:
-                    log.info(f"📉 Technical Signal [SELL] detected! Asking AI Ensemble for confirmation...")
+                    # 3.1 TradingContext 구성
                     trading_context = self.build_trading_context(klines)
                     ai_decision = None
                     if self.ai:
                         try:
+                            # 3.2 AI 분석
                             ai_decision = self.ai.analyze(trading_context)
                         except Exception as e:
                             log.warning(f"AI analysis failed: {e}")
 
-                    if ai_decision == 'SELL' or (self.ai is None and technical_signal == 'SELL'):
-                        final_decision = 'SELL'
-                        log.info("✅ Decision: SELL")
+                    # 3.3 AI 결정 처리
+                    decision_word = ai_decision.get('decision') if isinstance(ai_decision, dict) else ai_decision
+                    ai_payload = {
+                        'decision': decision_word,
+                        'reason': ai_decision.get('reason') if isinstance(ai_decision, dict) else '',
+                        'technical_signal': technical_signal,
+                        'ai_sources': {
+                            'openai': ai_decision.get('openai') if isinstance(ai_decision, dict) else None,
+                            'gemini': ai_decision.get('gemini') if isinstance(ai_decision, dict) else None,
+                        },
+                        'context': trading_context,
+                        'klines': klines,
+                        'price_plan': (ai_decision or {}).get('price_plan') if isinstance(ai_decision, dict) else None,
+                    }
+                    self._last_ai_result = ai_payload
+                    ai_history_store.record(ai_payload)
+                    log.info(f"AI decision: {decision_word} ({ai_payload['reason']})")
+                    # AI가 BUY 승인 또는 AI 미사용 시 기술지표를 기준으로 매수 결정
+                    if decision_word == 'BUY' or (self.ai is None and technical_signal == 'BUY'):
+                        final_decision = 'BUY'
+                        event_reason = 'AI 승인'
+                        log.info("✅ Decision: BUY")
+                        self._last_size_plan = self._prepare_position_plan(ai_payload)
                     else:
-                        log.info(f"❌ AI Ensemble REJECTED the SELL signal (AI said: {ai_decision}). Holding.")
+                        event_reason = 'AI 거절'
+                        log.info(f"❌ AI Ensemble REJECTED the BUY signal (AI said: {ai_decision}). Holding.")
+
+                # 매도 신호 처리
+                elif technical_signal == 'SELL' and self.in_position:
+                    if self._sell_on_cooldown():
+                        log.info("Sell signal suppressed due to cooldown")
+                        event_reason = 'Cooldown'
+                        final_decision = 'HOLD'
+                    else:
+                        log.info(f"📉 Technical Signal [SELL] detected! Asking AI Ensemble for confirmation...")
+                        # 3.1 TradingContext 구성
+                        trading_context = self.build_trading_context(klines)
+                        ai_decision = None
+                        if self.ai:
+                            try:
+                                # 3.2 AI 분석
+                                ai_decision = self.ai.analyze(trading_context)
+                            except Exception as e:
+                                log.warning(f"AI analysis failed: {e}")
+
+                        # 3.3 AI 결정 처리
+                        decision_word = ai_decision.get('decision') if isinstance(ai_decision, dict) else ai_decision
+                        ai_payload = {
+                            'decision': decision_word,
+                            'reason': ai_decision.get('reason') if isinstance(ai_decision, dict) else '',
+                            'technical_signal': technical_signal,
+                            'ai_sources': {
+                                'openai': ai_decision.get('openai') if isinstance(ai_decision, dict) else None,
+                                'gemini': ai_decision.get('gemini') if isinstance(ai_decision, dict) else None,
+                            },
+                            'context': trading_context,
+                            'klines': klines,
+                            'price_plan': (ai_decision or {}).get('price_plan') if isinstance(ai_decision, dict) else None,
+                        }
+                        self._last_ai_result = ai_payload
+                        ai_history_store.record(ai_payload)
+                        log.info(f"AI decision: {decision_word} ({ai_payload['reason']})")
+
+                        # AI가 SELL 승인 또는 AI 미사용 시 기술지표를 기준으로 매도 결정
+                        if decision_word == 'SELL' or (self.ai is None and technical_signal == 'SELL'):
+                            final_decision = 'SELL'
+                            event_reason = 'AI 승인'
+                            log.info("✅ Decision: SELL")
+                        else:
+                            event_reason = 'AI 거절'
+                            log.info(f"❌ AI Ensemble REJECTED the SELL signal (AI said: {ai_decision}). Holding.")
 
                 # 4. 매매 실행
+                self._log_event_check(technical_signal, ai_payload, final_decision, event_reason, config_info)
                 self.execute_trade(final_decision)
 
                 # 5. 루프 대기
-                time.sleep(self.loop_interval)
+                time.sleep(self.bot_interval)
 
             except KeyboardInterrupt:
                 log.info("Trading Bot stopped by user.")
@@ -519,53 +640,159 @@ class TradingBot:
     # 호출 시점: run() 메서드 내에서 매매 결정 후 호출
     # 매매 실행 담당
     def execute_trade(self, decision):
-        # 매수 처리
+        if decision not in ('BUY', 'SELL'):
+            return
+
+        payload = OrderRequest(
+            action=decision,
+            symbol=self.market,
+            amount_krw=self.trade_amount_krw,
+            volume=0.0,
+            reason=f"Auto-executed by {config.STRATEGY_NAME}",
+            metadata={'ai_result': self._last_ai_result or {'decision': decision, 'reason': ''}},
+        )
         if decision == 'BUY':
-            # calculate trade amount (use kelly if configured)
-            krw_balance = self.api.get_balance("KRW") # KRW 잔고 조회
-            trade_amount = self.trade_amount_krw # default trade amount
+            plan = self._last_size_plan or {}
+            payload.amount_krw = max(plan.get('trade_amount') or self.trade_amount_krw, config.MIN_ORDER_AMOUNT)
+            payload.trade_amount = plan.get('trade_amount')
+            payload.target_quantity = plan.get('quantity')
+            payload.entry_price = plan.get('entry_price')
+            payload.stop_loss_price = plan.get('stop_loss_price')
+            payload.take_profit_price = plan.get('take_profit_price')
+            payload.market_factor = plan.get('market_factor')
+            payload.risk_amount = plan.get('risk_amount')
+        else:
+            payload.action = 'SELL'
+            payload.volume = self.api.get_balance(self.market.split('-')[1])
+            payload.amount_krw = 0.0
+            self._last_sell_timestamp = time.time()
+            self._last_size_plan = None
+        self.order_executor.submit(payload)
 
-            # Kelly 기준으로 매수 금액 조정
-            if hasattr(self, 'money_manager') and self.money_manager:
-                trade_amount = self.money_manager.calculate_trade_amount(krw_balance) # 켈리 기준 매수 금액 계산
+    def _log_event_check(self, technical_signal, ai_payload, final_decision, reason, config_info):
+        signal_str = technical_signal or 'NONE'
+        ai_decision = ai_payload.get('decision') if ai_payload else 'N/A'
+        final_state = '보유' if self.in_position else '무포지션'
+        reason_text = reason or '미정'
+        current_vol = config_info.get('current_vol_pct')
+        ref_vol = config_info.get('reference_vol_pct')
+        tf_raw = config_info.get('timeframe', '')
+        if isinstance(tf_raw, str) and tf_raw.startswith('minute'):
+            tf_display = f"{tf_raw.replace('minute', '')}minute" if tf_raw != 'minute' else tf_raw
+        else:
+            tf_display = tf_raw
+        base_context = (f"strategy={config_info.get('strategy')} market={config_info.get('market')} "
+                        f"interval={config_info.get('loop_interval')}s trade_amount={config_info.get('trade_amount')}min_order={config_info.get('min_order')} "
+                        f"kelly={config_info.get('kelly')}")
+        if current_vol is not None:
+            vol_context = (f"현재 변동성 비율={current_vol:.0f}% 기준 변동성 비율={ref_vol:.0f}% "
+                           f"캔들시간단위={tf_display} 캔들개수={config_info.get('candle_count')}")
+        else:
+            vol_context = (f"현재 변동성 비율=- 기준 변동성 비율={ref_vol:.0f}% "
+                           f"캔들시간단위={tf_display} 캔들개수={config_info.get('candle_count')}")
+        log.info(
+            f"EventCheck: {base_context} | signal={signal_str} ai={ai_decision} final={final_decision} state={final_state} reason={reason_text} | {vol_context}"
+        )
 
-            # 최소 주문 금액 체크
-            if trade_amount < config.MIN_ORDER_AMOUNT:
-                log.warning(f"Trade amount ({trade_amount:,.0f} KRW) is below the minimum order amount ({config.MIN_ORDER_AMOUNT:,.0f} KRW). Skipping buy order.")
-                return
+    def _prepare_position_plan(self, ai_payload: dict | None) -> dict:
+        plan = (ai_payload or {}).get('price_plan') or {}
+        entry = plan.get('entry_price') or None
+        stop = plan.get('stop_loss_price') or None
+        take = plan.get('take_profit_price') or None
+        market_factor = plan.get('market_factor') if plan else None
+        if not entry or entry <= 0:
+            entry = self._fallback_price_from_context(ai_payload)
+        if not stop or stop <= 0:
+            stop = entry * 0.99
+        total_balance = self._estimate_total_equity(ai_payload)
+        available_cash = self._estimate_available_cash(ai_payload)
+        money_plan = None
+        if self.money_manager and total_balance and entry:
+            money_plan = self.money_manager.get_position_size(
+                total_balance=total_balance,
+                entry_price=entry,
+                stop_loss_price=stop,
+                market_factor=market_factor if market_factor is not None else 1.0,
+            )
+        trade_amount = (money_plan or {}).get('trade_amount') or self.trade_amount_krw
+        per_trade_cap = min(self.trade_amount_krw, available_cash or trade_amount)
+        if per_trade_cap > 0:
+            trade_amount = min(trade_amount, per_trade_cap)
+        if trade_amount < config.MIN_ORDER_AMOUNT:
+            trade_amount = config.MIN_ORDER_AMOUNT
+        quantity = (money_plan or {}).get('quantity') or (trade_amount / entry if entry else 0.0)
+        if quantity and entry:
+            quantity = trade_amount / entry
+        risk_amount = (money_plan or {}).get('risk_amount')
+        return {
+            'trade_amount': trade_amount,
+            'quantity': quantity,
+            'risk_amount': risk_amount,
+            'entry_price': entry,
+            'stop_loss_price': stop,
+            'take_profit_price': take,
+            'market_factor': market_factor,
+        }
 
-            # 잔고 부족 체크
-            if krw_balance < trade_amount:
-                log.warning(f"Insufficient balance. Required: {trade_amount:,.0f} KRW, Available: {krw_balance:,.0f} KRW")
-                return
+    def _fallback_price_from_context(self, ai_payload):
+        ctx = (ai_payload or {}).get('context') or {}
+        markets = ctx.get('markets') or []
+        if markets:
+            tf = markets[0].get('timeframes') or {}
+            tf_key = next(iter(tf.keys()), None)
+            if tf_key:
+                candle = tf[tf_key].get('last_candle') or {}
+                try:
+                    price = float(candle.get('close') or 0)
+                    if price > 0:
+                        return price
+                except Exception:
+                    pass
+        klines = (ai_payload or {}).get('klines') or []
+        if klines:
+            try:
+                price = float(klines[-1].get('trade_price') or 0)
+                if price > 0:
+                    return price
+            except Exception:
+                pass
+        fallback = self.api.get_klines(self.market, self.timeframe, 1)
+        if fallback:
+            try:
+                price = float(fallback[0].get('trade_price') or 0)
+                if price > 0:
+                    return price
+            except Exception:
+                pass
+        return float(config.DEFAULT_ENTRY_PRICE if hasattr(config, 'DEFAULT_ENTRY_PRICE') else 10000.0)
 
-            # 매수 주문 실행
-            log.info(f"Attempting to place a BUY order for {trade_amount:,.0f} KRW.")
-            result = self.api.place_order(self.market, 'bid', price=trade_amount, ord_type='price')
+    def _estimate_total_equity(self, ai_payload):
+        ctx = (ai_payload or {}).get('context') or {}
+        account = ctx.get('account') or {}
+        equity = account.get('total_equity_krw')
+        try:
+            if equity:
+                return float(equity)
+        except Exception:
+            pass
+        return None
 
-            # 주문 성공 시 상태 업데이트
-            if result:
-                log.info(f"Successfully placed BUY order: {result}")
-                self.in_position = True
-
-        # 매도 처리
-        elif decision == 'SELL':
-            coin_symbol = self.market.split('-')[1] # 'KRW-BTC' -> 'BTC'
-            balance_coin = self.api.get_balance(coin_symbol) # 보유 코인 잔고 조회
-
-            # 보유 코인 체크
-            if balance_coin is None or balance_coin <= 0:
-                log.warning(f"No {coin_symbol} balance to sell.")
-                return
-
-            # 매도 주문 실행
-            log.info(f"Attempting to place a SELL order for {balance_coin} {coin_symbol}.")
-            result = self.api.place_order(self.market, 'ask', volume=balance_coin, ord_type='market')
-            if result:
-                log.info(f"Successfully placed SELL order: {result}")
-                self.in_position = False
+    def _estimate_available_cash(self, ai_payload):
+        ctx = (ai_payload or {}).get('context') or {}
+        account = ctx.get('account') or {}
+        available = account.get('available_krw')
+        try:
+            if available is not None:
+                return float(available)
+        except Exception:
+            pass
+        return None
 
 
-if __name__ == "__main__":
+def main():
     bot = TradingBot()
     bot.run()
+
+
+if __name__ == '__main__':
+    main()

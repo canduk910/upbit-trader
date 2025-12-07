@@ -1,7 +1,7 @@
 import os
 import json
 from dotenv import load_dotenv
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from server.logger import log
 
 # --- 1. .env 파일에서 민감 정보 로드 ---
@@ -34,6 +34,22 @@ def _get_runtime_config_path():
     return os.path.join(project_root, 'runtime', 'config.json')
 
 
+def _migrate_config_schema(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize legacy config keys to the current schema without mutating the original dict."""
+    normalized = json.loads(json.dumps(cfg)) if isinstance(cfg, dict) else {}
+    strategy_params = normalized.setdefault('strategy_params', {})
+    vb_params = strategy_params.setdefault('VolatilityBreakout', {})
+    legacy = normalized.pop('vb_target_vol_pct', None)
+    if 'target_vol_pct' not in vb_params and legacy is not None:
+        try:
+            vb_params['target_vol_pct'] = float(legacy)
+        except (TypeError, ValueError):
+            vb_params['target_vol_pct'] = 30.0
+    if 'target_vol_pct' not in vb_params:
+        vb_params['target_vol_pct'] = 30.0
+    return normalized
+
+
 def load_config() -> Dict[str, Any]:
     """config.json 파일에서 설정을 로드하여 반환합니다."""
     config_path = _get_runtime_config_path()
@@ -41,7 +57,7 @@ def load_config() -> Dict[str, Any]:
         with open(config_path, 'r', encoding='utf-8') as f:
             config_data = json.load(f)
         log.info("runtime/config.json file loaded successfully.")
-        return config_data
+        return _migrate_config_schema(config_data)
     except FileNotFoundError:
         log.error("runtime/config.json not found! Please create a configuration file in runtime directory.")
         return {}
@@ -64,8 +80,9 @@ def save_config(new_config: Dict[str, Any]) -> bool:
             os.replace(config_path, backup_path)
             log.info(f"Existing config.json backed up to {backup_path}")
 
+        normalized = _migrate_config_schema(new_config)
         with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(new_config, f, ensure_ascii=False, indent=2)
+            json.dump(normalized, f, ensure_ascii=False, indent=2)
         log.info("New configuration saved to runtime/config.json")
         return True
     except Exception as e:
@@ -89,8 +106,9 @@ def _sync_globals_from_config(cfg: Dict[str, Any]):
     global MIN_ORDER_AMOUNT, TRADE_AMOUNT_KRW
     global USE_KELLY_CRITERION, KELLY_WIN_RATE, KELLY_PAYOFF_RATIO, KELLY_FRACTION
     global RSI_PERIOD, RSI_OVERSOLD, RSI_OVERBOUGHT
-    global VB_K_VALUE, DM_WINDOW
+    global VB_K_VALUE, VB_TARGET_VOL_PCT, DM_WINDOW
     global ENSEMBLE_STRATEGY, OPENAI_MODEL, GEMINI_MODEL
+    global BOT_ENABLED, BOT_INTERVAL_SEC, BOT_SELL_COOLDOWN_SEC
 
     STRATEGY_NAME = cfg.get("strategy_name", "RSI")
     MARKET = cfg.get("market", "KRW-BTC")
@@ -116,6 +134,7 @@ def _sync_globals_from_config(cfg: Dict[str, Any]):
 
     _vb_params = _strategy_params.get("VolatilityBreakout", {})
     VB_K_VALUE = _vb_params.get("k_value", 0.5)
+    VB_TARGET_VOL_PCT = _vb_params.get("target_vol_pct", 30.0)
 
     _dm_params = _strategy_params.get("DualMomentum", {})
     DM_WINDOW = _dm_params.get("window", 12)
@@ -124,6 +143,13 @@ def _sync_globals_from_config(cfg: Dict[str, Any]):
     ENSEMBLE_STRATEGY = _ai_ensemble_settings.get("strategy", "UNANIMOUS")
     OPENAI_MODEL = _ai_ensemble_settings.get("openai_model", "gpt-5.1-nano")
     GEMINI_MODEL = _ai_ensemble_settings.get("gemini_model", "gemini-2.5-flash")
+
+    bot_enabled = cfg.get("bot_enabled")
+    if bot_enabled is None:
+        bot_enabled = True
+    BOT_ENABLED = bool(bot_enabled)
+    BOT_INTERVAL_SEC = float(cfg.get("bot_interval_sec", 5.0))
+    BOT_SELL_COOLDOWN_SEC = float(cfg.get("bot_sell_cooldown_sec", 120.0))
 
 
 # 초기 로드 이후 전역 변수 동기화
@@ -169,8 +195,9 @@ RSI_PERIOD = _rsi_params.get("period", 14)
 RSI_OVERSOLD = _rsi_params.get("oversold", 30)
 RSI_OVERBOUGHT = _rsi_params.get("overbought", 70)
 
-_vb_params = _strategy_params.get("VolatilityBreakout", {})
+_vb_params = _config.get("strategy_params", {}).get("VolatilityBreakout", {})
 VB_K_VALUE = _vb_params.get("k_value", 0.5)
+VB_TARGET_VOL_PCT = _vb_params.get("target_vol_pct", 30.0)
 
 _dm_params = _strategy_params.get("DualMomentum", {})
 DM_WINDOW = _dm_params.get("window", 12)
@@ -180,4 +207,28 @@ ENSEMBLE_STRATEGY = _ai_ensemble_settings.get("strategy", "UNANIMOUS")
 OPENAI_MODEL = _ai_ensemble_settings.get("openai_model", "gpt-5.1-nano")
 GEMINI_MODEL = _ai_ensemble_settings.get("gemini_model", "gemini-2.5-flash")
 
+BOT_ENABLED = _config.get("bot_enabled", True)
+BOT_INTERVAL_SEC = float(_config.get("bot_interval_sec", 5.0))
+BOT_SELL_COOLDOWN_SEC = float(_config.get("bot_sell_cooldown_sec", 120.0))
+
 log.info(f"Configuration loaded: Strategy='{STRATEGY_NAME}', Market='{MARKET}'")
+log.debug(f"Volatility breakout target volatility pct set to {VB_TARGET_VOL_PCT}")
+
+
+def update_bot_control(bot_enabled: Optional[bool] = None, bot_interval_sec: Optional[float] = None, bot_sell_cooldown_sec: Optional[float] = None):
+    """Update bot control values and persist them."""
+    global _config
+    updated = False
+    if bot_enabled is not None:
+        _config['bot_enabled'] = bool(bot_enabled)
+        updated = True
+    if bot_interval_sec is not None:
+        _config['bot_interval_sec'] = float(bot_interval_sec)
+        updated = True
+    if bot_sell_cooldown_sec is not None:
+        _config['bot_sell_cooldown_sec'] = float(bot_sell_cooldown_sec)
+        updated = True
+    if updated:
+        save_config(_config)
+        reload_config()
+    return updated

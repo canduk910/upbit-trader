@@ -23,6 +23,8 @@ from server import config               # 런타임 설정 관리
 from server.upbit_api import UpbitAPI   # 업비트 API 연동
 from server.logger import log           # 로깅 설정
 from server.history import history_store
+from server.history import order_history_store
+from server.history import ai_history_store
 from server.ws_listener_base import (
     load_ws_stats,
     summarize_ws_stats,
@@ -636,19 +638,36 @@ def _watcher_loop(stop_event, market: str, check_interval: float, callbacks: Lis
 
                 # 콜백 조건 체크
                 if prev_close is not None and curr_close is not None: # 유효한 데이터 시
-                    # 각 콜백 조건별 체크
+                    avg_vol = sum(volumes[1:]) / (len(volumes)-1) if len(volumes) > 1 else 0
+                    statuses = []
                     for cb in callbacks:
-                        if cb.get('type') == 'volatility_breakout':
-                            k = cb.get('k', 0.5) # 기본 k=0.5
-                            # when current close > prev_close + range * k
-                            if curr_close > (prev_close + volatility_range * k):
+                        cb_type = cb.get('type')
+                        # 변동성 돌파 체크
+                        if cb_type == 'volatility_breakout':
+                            k = cb.get('k', 0.5)
+                            triggered = curr_close > (prev_close + volatility_range * k)
+                            status = (
+                                f"volatility_breakout(k={k}) current={curr_close:.0f} prev={prev_close:.0f} "
+                                f"range={volatility_range:.0f} triggered={triggered}"
+                            )
+                            statuses.append(status)
+                            if triggered:
                                 log.info(f"Watcher detected volatility breakout on {market} (k={k})")
-                        elif cb.get('type') == 'volume_spike':
-                            multiplier = cb.get('multiplier', 3) # 기본 multiplier=3
-                            # 평균 거래량 대비 현재 거래량이 multiplier 배 이상인 경우
-                            avg_vol = sum(volumes[1:]) / (len(volumes)-1) if len(volumes) > 1 else 0
-                            if avg_vol and volumes[0] > avg_vol * multiplier: # 거래량 급증 감지
+                        # 거래량 급증 체크
+                        elif cb_type == 'volume_spike':
+                            multiplier = cb.get('multiplier', 3)
+                            triggered = avg_vol and volumes[0] > avg_vol * multiplier
+                            status = (
+                                f"volume_spike(mult={multiplier}) current_vol={volumes[0]:.0f} avg_vol={avg_vol:.0f} "
+                                f"triggered={bool(triggered)}"
+                            )
+                            statuses.append(status)
+                            if triggered:
                                 log.info(f"Watcher detected volume spike on {market} (x{multiplier})")
+                        else:
+                            statuses.append(f"unknown callback {cb}")
+                    config_desc = (f"market={market} interval={check_interval}s callbacks={len(callbacks)}")
+                    log.info(f"WatcherCheck: {config_desc} | { ' ; '.join(statuses)}")
 
             time.sleep(check_interval)
         except Exception as e:
@@ -1054,11 +1073,22 @@ def get_positions():
     return result
 
 
+@app.get('/ai/history')
+def get_ai_history(limit: int = 50):
+    try:
+        limit = max(1, min(int(limit), 200))
+    except Exception:
+        limit = 50
+    history = ai_history_store.get_history(limit=limit)
+    return {'items': history}
+
+
 @app.get('/positions/history')
 def get_positions_history(limit: int = 365, days: int = 365):
     since = time.time() - float(days) * 86400
     history = history_store.get_history(since=since, limit=limit)
     return {'history': history}
+
 
 @app.post('/ws/start')
 def ws_start():
@@ -1161,3 +1191,32 @@ def ws_ticker_data():
             'timestamp': data.get('trade_timestamp') or data.get('timestamp'),
         })
     return {'tickers': payloads}
+
+# --- Trading Bot Control API ---
+
+# 봇 실행 중 여부 확인
+def _bot_running():
+    return config.BOT_ENABLED
+
+
+@app.post('/bot/control')
+def bot_control(payload: Dict[str, Any]):
+    enabled = payload.get('enabled')
+    interval = payload.get('interval_sec')
+    if enabled is None and interval is None:
+        raise HTTPException(status_code=400, detail='enabled or interval_sec required')
+    try:
+        updated = config.update_bot_control(bot_enabled=enabled, bot_interval_sec=interval)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Failed to update bot config: {exc}')
+    return {'status': 'updated', 'bot_enabled': config.BOT_ENABLED, 'bot_interval_sec': config.BOT_INTERVAL_SEC, 'updated': updated}
+
+
+@app.get('/bot/status')
+def bot_status():
+    return {
+        'bot_enabled': config.BOT_ENABLED,
+        'bot_interval_sec': config.BOT_INTERVAL_SEC,
+        'running': config.BOT_ENABLED,
+    }
+

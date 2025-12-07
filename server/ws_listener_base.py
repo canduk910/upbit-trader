@@ -13,12 +13,14 @@ import websocket  # websocket-client
 
 from server.config import get_setting
 from server.logger import get_logger, logging
+from server.upbit_api import UpbitAPI
 
 UPBIT_WS_URL = "wss://api.upbit.com/websocket/v1"
 EXEC_HISTORY_DIR = Path(__file__).resolve().parents[1] / "runtime" / "history"
 EXEC_HISTORY_LOCK = threading.Lock()
 WS_STATS_FILE = EXEC_HISTORY_DIR / "ws_stats.json"
 KST = timezone(timedelta(hours=9))
+_UPBIT_PUBLIC_API = UpbitAPI()
 
 def _timeframe_to_seconds(timeframe: str) -> int:
     if not isinstance(timeframe, str):
@@ -37,6 +39,36 @@ def _timeframe_to_seconds(timeframe: str) -> int:
     if tf.startswith("day"):
         return 86400
     return 60
+
+
+def _make_kst_timestamp(value: Any) -> int:
+    try:
+        if isinstance(value, (int, float)):
+            return int(float(value))
+        if isinstance(value, str):
+            if value.endswith('+0900') or value.endswith('-0900'):
+                try:
+                    return int(datetime.strptime(value, '%Y-%m-%dT%H:%M:%S%z').timestamp() * 1000)
+                except ValueError:
+                    pass
+            try:
+                return int(datetime.fromisoformat(value).timestamp() * 1000)
+            except ValueError:
+                pass
+        return int(float(value) * 1000)
+    except Exception:
+        return int(time.time() * 1000)
+
+
+def _normalize_candle_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = payload.copy()
+    ts = normalized.get('timestamp') or normalized.get('candle_date_time_kst') or normalized.get('trade_timestamp')
+    normalized_ts = _make_kst_timestamp(ts)
+    qualifier = datetime.fromtimestamp(normalized_ts / 1000.0, KST)
+    normalized['timestamp'] = normalized_ts
+    normalized['candle_date_time_kst'] = qualifier.strftime('%Y-%m-%dT%H:%M:%S%z')
+    normalized['candle_acc_trade_volume'] = normalized.get('candle_acc_trade_volume') or normalized.get('volume') or 0.0
+    return normalized
 
 
 def _ensure_history_dir() -> None:
@@ -185,6 +217,8 @@ class BaseWebsocketListener(abc.ABC):
         self._stats_history: deque[Dict[str, Any]] = deque(maxlen=self._stats_history_limit)
         self.history_store = ExecHistoryStore()
         self._entry_prices: Dict[str, float] = {}
+        self._initial_timeframes = self._build_initial_timeframes()
+        self._initial_cache_loaded = False
         self._load_stats()
 
     @property
@@ -255,20 +289,69 @@ class BaseWebsocketListener(abc.ABC):
                 seen.append(tf)
         return seen
 
+    def _build_initial_timeframes(self) -> List[str]:
+        base_frames = [get_setting("timeframe") or "minute5"]
+        if "minute1" not in base_frames:
+            base_frames.insert(0, "minute1")
+        for tf in self._timeframes:
+            if tf not in base_frames:
+                base_frames.append(tf)
+        return base_frames[:3]
+
+    def _ensure_initial_klines_cache(self) -> None:
+        if self.redis_client is None or self._initial_cache_loaded:
+            return
+        count = int(get_setting("prefetch_count") or get_setting("candle_count") or 200)
+        for timeframe in self._initial_timeframes:
+            for ticker in self._targets:
+                self._fetch_and_store_initial_candles(ticker, timeframe, count)
+        self._initial_cache_loaded = True
+
+    def _fetch_and_store_initial_candles(self, ticker: str, timeframe: str, count: int) -> None:
+        try:
+            candles = _UPBIT_PUBLIC_API.get_klines(ticker, timeframe, count=count)
+        except Exception as exc:
+            self.logger.warning("Initial candle fetch failed for %s %s: %s", ticker, timeframe, exc)
+            return
+        if not candles:
+            return
+        key = f"ws:candles:{timeframe}:{ticker}"
+        try:
+            self.redis_client.delete(key)
+        except Exception:
+            pass
+        pushed = 0
+        for candle in reversed(candles):
+            payload = _normalize_candle_payload({
+                "ticker": ticker,
+                "timeframe": timeframe,
+                "timestamp": candle.get("timestamp") or candle.get("candle_date_time_kst"),
+                "open": candle.get("opening_price"),
+                "high": candle.get("high_price"),
+                "low": candle.get("low_price"),
+                "close": candle.get("trade_price"),
+                "volume": candle.get("candle_acc_trade_volume"),
+            })
+            try:
+                self.redis_client.lpush(key, json.dumps(payload))
+                pushed += 1
+            except Exception as exc:
+                self.logger.warning("Failed to push initial candle for %s %s: %s", ticker, timeframe, exc)
+                break
+        try:
+            self.redis_client.ltrim(key, 0, self._candle_history_limit - 1)
+        except Exception:
+            pass
+        self.logger.info("Initial candle cache filled for %s %s (%d entries)", ticker, timeframe, pushed)
+
     def _push_candle(self, ticker: str, timeframe: str, candle: Dict[str, Any]) -> None:
         if self.redis_client is None:
             return
         try:
             key = f"ws:candles:{timeframe}:{ticker}"
-            payload = candle.copy()
-            ts = payload.get("timestamp")
-            if ts:
-                try:
-                    qualifier = datetime.fromtimestamp(ts / 1000.0, KST)
-                    payload["candle_date_time_kst"] = qualifier.strftime("%Y-%m-%dT%H:%M:%S%z")
-                except Exception:
-                    pass
-            payload.setdefault("candle_acc_trade_volume", payload.get("volume", 0.0))
+            payload = _normalize_candle_payload(candle)
+            payload["ticker"] = ticker
+            payload.setdefault("timeframe", timeframe)
             self.redis_client.lpush(key, json.dumps(payload))
             self.redis_client.ltrim(key, 0, self._candle_history_limit - 1)
         except Exception as exc:
@@ -436,7 +519,7 @@ class BaseWebsocketListener(abc.ABC):
     def _run(self) -> None:
         while not self._stop_event.is_set():
             if not self._pre_run():
-                time.sleep(5)
+                time.sleep(30)
                 continue
             try:
                 ws_app = websocket.WebSocketApp(
@@ -447,7 +530,7 @@ class BaseWebsocketListener(abc.ABC):
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
-                ws_app.run_forever(ping_interval=20, ping_timeout=10)
+                ws_app.run_forever(ping_interval=30, ping_timeout=10)
             except Exception as exc:
                 self.logger.warning(f"Websocket listener restart: {exc}")
             time.sleep(2)
@@ -486,6 +569,7 @@ class BaseWebsocketListener(abc.ABC):
         self.logger.info("Websocket listener stopped.")
 
     def _pre_run(self) -> bool:
+        self._ensure_initial_klines_cache()
         return True
 
     @abc.abstractmethod

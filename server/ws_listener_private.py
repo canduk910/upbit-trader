@@ -63,3 +63,12 @@ class PrivateWebsocketListener(BaseWebsocketListener):
         if payload.get('type') != 'myOrder':
             return
         self._record_exec_history(payload)
+
+
+def main():
+    listener = PrivateWebsocketListener()
+    listener.run()
+
+
+if __name__ == '__main__':
+    main()

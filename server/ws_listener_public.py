@@ -25,3 +25,12 @@ class PublicWebsocketlistener(BaseWebsocketListener):
         if payload.get('type') != 'ticker':
             raise ValueError('Unexpected payload type for public listener')
         self._aggregate_candle(payload)
+
+
+def main():
+    listener = PublicWebsocketlistener()
+    listener.run()
+
+
+if __name__ == '__main__':
+    main()

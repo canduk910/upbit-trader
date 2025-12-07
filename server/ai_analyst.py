@@ -2,6 +2,8 @@ import json
 import concurrent.futures
 import server.config as config
 from server.logger import log
+from server.history import ai_history_store
+from datetime import datetime, timezone, timedelta
 
 # OpenAI SDK
 # Defensive imports
@@ -30,6 +32,7 @@ class EnsembleAnalyzer:
         self.openai_client = None
         self.openai_model = None
         self.gemini_model = None
+        self._openai_fallback_tried = False
 
         # 1. OpenAI 초기화 (가능한 경우)
         if openai is None:
@@ -51,7 +54,7 @@ class EnsembleAnalyzer:
                             self.openai_client = openai # 패키지 자체를 클라이언트로 사용
                         except Exception as e:
                             log.warning(f'Failed to init OpenAI client: {e}')
-                    self.openai_model = getattr(config, 'OPENAI_MODEL', None)
+                    self.openai_model = getattr(config, 'OPENAI_MODEL', None) or self._default_openai_model()
 
             except Exception as e:
                 log.warning(f'Failed to init OpenAI client: {e}')
@@ -69,6 +72,20 @@ class EnsembleAnalyzer:
                     self.gemini_model = genai.GenerativeModel(getattr(config, 'GEMINI_MODEL', None)) # 모델 인스턴스
             except Exception as e:
                 log.warning(f'Failed to init Gemini client: {e}')
+
+    def _default_openai_model(self):
+        return 'o4-mini'
+
+    def _next_openai_fallback(self, current_model: str | None):
+        preferred = [
+            getattr(config, 'OPENAI_FALLBACK_MODEL', None),
+            'gpt-5-mini',
+            'gpt-5-nano',
+        ]
+        for cand in preferred:
+            if cand and cand != current_model:
+                return cand
+        return None
 
     # 시스템 프롬프트 생성 메서드
     # OpenAI 및 Gemini에 동일한 시스템 프롬프트 사용
@@ -121,6 +138,12 @@ class EnsembleAnalyzer:
                 "stop_loss": "예: 15분봉 종가 기준 -3% 하락 시 전량 손절",
                 "take_profit": "예: 단기 저항선 또는 +5~8% 구간에서 분할 매도",
                 "notes": "추가로 주의해야 할 사항"
+              },
+              "price_plan": {
+                "entry_price": 0.0,
+                "stop_loss_price": 0.0,
+                "take_profit_price": 0.0,
+                "market_factor": 0.0
               }
             }
           ],
@@ -129,6 +152,13 @@ class EnsembleAnalyzer:
             {"type": "MAX_DRAWDOWN", "severity": "LOW|MEDIUM|HIGH", "message": "..."}
           ]
         }
+
+        [추가 지침]
+        - 각 decision.price_plan의 수치는 반드시 숫자로만 채워라.
+        - entry_price, stop_loss_price, take_profit_price는 KRW 단위이며 최근 시세와 일관되게 산출한다.
+        - market_factor는 0.0~1.0 범위에서 현재 시장의 공격적/보수적 정도를 나타내는 실수다.
+        - stop_loss_price는 entry_price보다 낮아야 하며, take_profit_price는 entry_price보다 높아야 한다.
+        - price_plan 정보를 반드시 포함시켜 downstream 시스템이 직접 활용할 수 있게 한다.
 
         [판단 원칙]
         1. 업비트 현물 계좌 특성을 지켜라.
@@ -176,6 +206,9 @@ class EnsembleAnalyzer:
     # TradingDecision JSON 스키마 기준
     # 반환값: (dict) {"source": "OpenAI", "decision": "...", "reason": "..."}
     def _ask_openai(self, system_prompt, user_prompt):
+        if not self.openai_client or not self.openai_model:
+            log.warning('OpenAI client or model not initialized; skipping request.')
+            return {"source": "OpenAI", "decision": "ERROR", "reason": "client_not_initialized"}
         try:
             # OpenAI ChatCompletion API 호출
             response = self.openai_client.chat.completions.create(
@@ -238,10 +271,25 @@ class EnsembleAnalyzer:
                     decision = "HOLD"
                 reason = str(result.get("reason", ""))
 
-            return {"source": "OpenAI", "decision": decision, "reason": reason}
+            return {
+                "source": "OpenAI",
+                "decision": decision,
+                "reason": reason,
+                "model": self.openai_model,
+                "raw": result,
+                "raw_text": raw,
+            }
         except Exception as e:
-            log.error(f"OpenAI Error: {e}")
-            return {"source": "OpenAI", "decision": "ERROR", "reason": str(e)}
+            err_msg = str(e)
+            log.error(f"OpenAI Error: {err_msg}")
+            if ('model_not_found' in err_msg.lower() or 'does not exist' in err_msg.lower()) and not self._openai_fallback_tried:
+                fallback = self._next_openai_fallback(self.openai_model)
+                if fallback:
+                    log.warning(f"OpenAI model '{self.openai_model}' unavailable. Falling back to '{fallback}'.")
+                    self.openai_model = fallback
+                    self._openai_fallback_tried = True
+                    return self._ask_openai(system_prompt, user_prompt)
+            return {"source": "OpenAI", "decision": "ERROR", "reason": err_msg, "model": self.openai_model}
 
     # Gemini에게 질문 메서드
     # TradingDecision JSON 스키마 기준
@@ -308,16 +356,203 @@ class EnsembleAnalyzer:
                     decision = "HOLD"
                 reason = str(result.get("reason", ""))
 
-            return {"source": "Gemini", "decision": decision, "reason": reason}
+            return {
+                "source": "Gemini",
+                "decision": decision,
+                "reason": reason,
+                "model": getattr(self.gemini_model, 'model_name', None),
+                "raw": result,
+                "raw_text": raw,
+            }
         except Exception as e:
             log.error(f"Gemini Error: {e}")
             return {"source": "Gemini", "decision": "ERROR", "reason": str(e)}
+
+    def _augment_with_historical_klines(self, trading_context: dict, max_bars: int = 100):
+        """Ensure trading context markets[0]['klines'] contains recent candles."""
+        markets = trading_context.get('markets') or []
+        if not markets:
+            return trading_context
+        market = markets[0]
+        klines = market.get('klines') or []
+        if isinstance(klines, dict):
+            klines = klines.get('candles') or klines.get('history') or []
+        if isinstance(klines, str):
+            try:
+                klines = json.loads(klines)
+            except Exception:
+                klines = []
+        if len(klines) < max_bars:
+            fallback = market.get('timeframes', {})
+            for tf in fallback.values():
+                candidates = tf.get('candles') or tf.get('history') or tf.get('klines')
+                if candidates:
+                    klines = candidates[-max_bars:]
+                    break
+        market['klines'] = klines[-max_bars:]
+        trading_context['markets'][0] = market
+        return trading_context
+
+    def _extract_confidence(self, result: dict) -> float:
+        raw = result.get('raw') if isinstance(result, dict) else None
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = None
+        if isinstance(raw, dict):
+            decisions = raw.get('decisions')
+            if isinstance(decisions, list) and decisions:
+                try:
+                    conf = float(decisions[0].get('confidence'))
+                    if 0 <= conf <= 1:
+                        return conf
+                except Exception:
+                    pass
+        try:
+            conf = float(result.get('confidence'))
+            if 0 <= conf <= 1:
+                return conf
+        except Exception:
+            pass
+        return 0.5
+
+    def _safe_float(self, value):
+        try:
+            f_val = float(value)
+            if f_val == float('inf') or f_val == float('-inf'):
+                return None
+            return f_val
+        except Exception:
+            return None
+
+    def _extract_price_plan(self, result: dict) -> dict | None:
+        raw = result.get('raw') if isinstance(result, dict) else None
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = None
+        if not isinstance(raw, dict):
+            return None
+        decisions = raw.get('decisions')
+        if not (isinstance(decisions, list) and decisions):
+            return None
+        target_symbol = getattr(config, 'MARKET', None)
+        target = None
+        if target_symbol:
+            for item in decisions:
+                if item.get('symbol') == target_symbol:
+                    target = item
+                    break
+        if target is None:
+            target = decisions[0]
+        plan = target.get('price_plan') if isinstance(target, dict) else None
+        return plan if isinstance(plan, dict) else None
+
+    def _last_close_from_context(self, trading_context: dict, klines: list | None) -> float:
+        markets = trading_context.get('markets') or []
+        if markets:
+            timeframes = (markets[0].get('timeframes') or {})
+            if timeframes:
+                tf_key = next(iter(timeframes.keys()), None)
+                if tf_key:
+                    last_candle = (timeframes[tf_key] or {}).get('last_candle') or {}
+                    try:
+                        last_close = float(last_candle.get('close') or 0)
+                        if last_close > 0:
+                            return last_close
+                    except Exception:
+                        pass
+        if klines:
+            try:
+                last_close = float(klines[-1].get('trade_price') or 0)
+                if last_close > 0:
+                    return last_close
+            except Exception:
+                pass
+        return float(getattr(config, 'FALLBACK_ENTRY_PRICE', 10000.0))
+
+    def _derive_price_plan(self, trading_context: dict, klines: list | None, openai_result: dict, gemini_result: dict) -> dict:
+        last_close = self._last_close_from_context(trading_context, klines)
+        plans = [self._extract_price_plan(openai_result), self._extract_price_plan(gemini_result)]
+        plans = [p for p in plans if p]
+
+        entry_candidates = []
+        stop_candidates = []
+        take_candidates = []
+        factor_candidates = []
+
+        for plan in plans:
+            entry_val = self._safe_float(plan.get('entry_price'))
+            stop_val = self._safe_float(plan.get('stop_loss_price'))
+            take_val = self._safe_float(plan.get('take_profit_price'))
+            factor_val = self._safe_float(plan.get('market_factor'))
+
+            if entry_val and entry_val > 0:
+                entry_candidates.append(entry_val)
+            if stop_val and stop_val > 0:
+                stop_candidates.append(stop_val)
+            if take_val and take_val > 0:
+                take_candidates.append(take_val)
+            if factor_val is not None:
+                factor_candidates.append(max(0.0, min(1.0, factor_val)))
+
+        if entry_candidates:
+            entry_price = sum(entry_candidates) / len(entry_candidates)
+        else:
+            entry_price = last_close
+
+        prices = []
+        for item in klines or []:
+            try:
+                prices.append(float(item.get('trade_price') or 0))
+            except Exception:
+                continue
+        if len(prices) < 2:
+            prices = [entry_price * 0.99, entry_price]
+        recent = prices[-30:]
+        diffs = []
+        for prev, curr in zip(recent[:-1], recent[1:]):
+            if prev:
+                diffs.append(abs(curr - prev) / prev)
+        avg_move_pct = sum(diffs) / len(diffs) if diffs else 0.01
+        avg_move_pct = max(0.003, min(0.05, avg_move_pct * 1.5))
+
+        if stop_candidates:
+            stop_loss_price = max(stop_candidates)
+        else:
+            stop_loss_price = max(1.0, entry_price * (1 - avg_move_pct))
+
+        if take_candidates:
+            take_profit_price = min(take_candidates)
+        else:
+            take_profit_price = entry_price * (1 + avg_move_pct * 1.8)
+
+        stop_loss_price = min(stop_loss_price, entry_price * 0.999)
+        take_profit_price = max(take_profit_price, entry_price * 1.001)
+
+        if factor_candidates:
+            market_factor = sum(factor_candidates) / len(factor_candidates)
+        else:
+            openai_conf = self._extract_confidence(openai_result)
+            gemini_conf = self._extract_confidence(gemini_result)
+            market_factor = max(0.0, min(1.0, (openai_conf + gemini_conf) / 2))
+
+        return {
+            'entry_price': entry_price,
+            'stop_loss_price': stop_loss_price,
+            'take_profit_price': take_profit_price,
+            'market_factor': market_factor,
+        }
 
     # 분석 메서드 (앙상블)
     # TradingContext 딕셔너리를 두 AI 모델에 병렬로 전달
     # 각 모델의 결과를 수집하여 앙상블 전략에 따라 최종 매매 결정 생성
     # 반환값: (str) 최종 매매 결정 ('BUY', 'SELL', 'HOLD')
     def analyze(self, trading_context: dict):
+        # 최근 100개 캔들 보강
+        trading_context = self._augment_with_historical_klines(trading_context, 100)
         # 시스템 및 사용자 프롬프트 생성
         system_prompt = self._get_system_prompt()
         user_prompt = self._get_user_prompt(trading_context)
@@ -339,13 +574,24 @@ class EnsembleAnalyzer:
         log.info(f"[Gemini] {decision_gemini} ({result_gemini['reason']})")
 
         final_decision = 'HOLD'
+        final_reason = []
 
         # 오류 감지 시 기본 HOLD
         if decision_openai == 'ERROR' or decision_gemini == 'ERROR':
             log.warning(
                 f"AI error detected. Fallback to HOLD. OpenAI={decision_openai}, Gemini={decision_gemini}"
             )
-            return 'HOLD'
+            final_reason.append("AI error fallback")
+            result_payload = {
+                'decision': 'HOLD',
+                'reason': 'AI error fallback',
+                'openai': result_openai,
+                'gemini': result_gemini,
+                'context': trading_context,
+                'klines': trading_context.get('markets', [{}])[0].get('klines') if trading_context.get('markets') else None,
+            }
+            ai_history_store.record(result_payload)
+            return result_payload
 
         # 앙상블 전략 적용
         # 1. 다수결 원칙 전략
@@ -358,13 +604,37 @@ class EnsembleAnalyzer:
                 log.info(
                     f"==> Disagreement (OpenAI:{decision_openai} vs Gemini:{decision_gemini}). Result: HOLD"
                 )
+                final_reason.append('AI disagreement')
         # 2. ANY 전략
         # BUY 또는 SELL 신호가 하나라도 있으면 해당 신호 채택
         elif config.ENSEMBLE_STRATEGY == 'ANY':
             if 'BUY' in [decision_openai, decision_gemini]:
                 final_decision = 'BUY'
+                final_reason.append('AI any-strategy BUY override')
             elif 'SELL' in [decision_openai, decision_gemini]:
                 final_decision = 'SELL'
+                final_reason.append('AI any-strategy SELL override')
 
-        return final_decision
+        final_reason.append(f"Final decision {final_decision}")
+        primary_market = None
+        try:
+            markets = trading_context.get('markets', [])
+            if markets:
+                primary_market = markets[0]
+        except Exception:
+            primary_market = None
 
+        market_klines = (primary_market or {}).get('klines') if primary_market else None
+        price_plan = self._derive_price_plan(trading_context, market_klines, result_openai, result_gemini)
+
+        result_payload = {
+            'decision': final_decision,
+            'reason': ' | '.join(final_reason) if final_reason else '',
+            'openai': result_openai,
+            'gemini': result_gemini,
+            'context': trading_context,
+            'klines': market_klines,
+            'price_plan': price_plan,
+        }
+        ai_history_store.record(result_payload)
+        return result_payload
