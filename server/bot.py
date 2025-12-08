@@ -54,6 +54,9 @@ class TradingBot:
         self._last_sell_timestamp = 0.0
         self._last_size_plan = None
 
+        # AI 거절 쿨다운 관련 변수
+        self._ai_reject_cooldown_end_ts = 0.0
+
         # 3. 초기 자산 상태 확인
         self.in_position = self.check_initial_position()
         log.info(f"Initial Position Status: {'HOLDING (매도 대기)' if self.in_position else 'NO POSITION (매수 대기)'}")
@@ -528,53 +531,67 @@ class TradingBot:
                     config_info['reference_vol_pct'] = float(getattr(config, 'VB_TARGET_VOL_PCT', 30.0))
 
                 # 3. AI 분석 및 최종 매매 결정
+                current_ts = time.time()
+                is_ai_cooling_down = (current_ts < self._ai_reject_cooldown_end_ts)
+
                 # 기술적신호 상 신호를 받아 AI에게 자문한다.
                 # 매수 신호 처리
                 if technical_signal == 'BUY' and not self.in_position:
-                    log.info(f"🚀 Technical Signal [BUY] detected! Asking AI Ensemble for confirmation...")
-
-                    # 3.1 TradingContext 구성
-                    trading_context = self.build_trading_context(klines)
-                    ai_decision = None
-                    if self.ai:
-                        try:
-                            # 3.2 AI 분석
-                            ai_decision = self.ai.analyze(trading_context)
-                        except Exception as e:
-                            log.warning(f"AI analysis failed: {e}")
-
-                    # 3.3 AI 결정 처리
-                    decision_word = ai_decision.get('decision') if isinstance(ai_decision, dict) else ai_decision
-                    ai_payload = {
-                        'decision': decision_word,
-                        'reason': ai_decision.get('reason') if isinstance(ai_decision, dict) else '',
-                        'technical_signal': technical_signal,
-                        'ai_sources': {
-                            'openai': ai_decision.get('openai') if isinstance(ai_decision, dict) else None,
-                            'gemini': ai_decision.get('gemini') if isinstance(ai_decision, dict) else None,
-                        },
-                        'context': trading_context,
-                        'klines': klines,
-                        'price_plan': (ai_decision or {}).get('price_plan') if isinstance(ai_decision, dict) else None,
-                    }
-                    self._last_ai_result = ai_payload
-                    ai_history_store.record(ai_payload)
-                    log.info(f"AI decision: {decision_word} ({ai_payload['reason']})")
-                    # AI가 BUY 승인 또는 AI 미사용 시 기술지표를 기준으로 매수 결정
-                    if decision_word == 'BUY' or (self.ai is None and technical_signal == 'BUY'):
-                        final_decision = 'BUY'
-                        event_reason = 'AI 승인'
-                        log.info("✅ Decision: BUY")
-                        self._last_size_plan = self._prepare_position_plan(ai_payload)
+                    if is_ai_cooling_down:
+                        log.info(f"Skipping AI check due to recent rejection (Cooldown until {time.strftime('%H:%M:%S', time.localtime(self._ai_reject_cooldown_end_ts))})")
+                        event_reason = 'AI 쿨다운'
+                        final_decision = 'HOLD'
                     else:
-                        event_reason = 'AI 거절'
-                        log.info(f"❌ AI Ensemble REJECTED the BUY signal (AI said: {ai_decision}). Holding.")
+                        log.info(f"🚀 Technical Signal [BUY] detected! Asking AI Ensemble for confirmation...")
+
+                        # 3.1 TradingContext 구성
+                        trading_context = self.build_trading_context(klines)
+                        ai_decision = None
+                        if self.ai:
+                            try:
+                                # 3.2 AI 분석
+                                ai_decision = self.ai.analyze(trading_context)
+                            except Exception as e:
+                                log.warning(f"AI analysis failed: {e}")
+
+                        # 3.3 AI 결정 처리
+                        decision_word = ai_decision.get('decision') if isinstance(ai_decision, dict) else ai_decision
+                        ai_payload = {
+                            'decision': decision_word,
+                            'reason': ai_decision.get('reason') if isinstance(ai_decision, dict) else '',
+                            'technical_signal': technical_signal,
+                            'ai_sources': {
+                                'openai': ai_decision.get('openai') if isinstance(ai_decision, dict) else None,
+                                'gemini': ai_decision.get('gemini') if isinstance(ai_decision, dict) else None,
+                            },
+                            'context': trading_context,
+                            'klines': klines,
+                            'price_plan': (ai_decision or {}).get('price_plan') if isinstance(ai_decision, dict) else None,
+                        }
+                        self._last_ai_result = ai_payload
+                        ai_history_store.record(ai_payload)
+                        log.info(f"AI decision: {decision_word} ({ai_payload['reason']})")
+                        # AI가 BUY 승인 또는 AI 미사용 시 기술지표를 기준으로 매수 결정
+                        if decision_word == 'BUY' or (self.ai is None and technical_signal == 'BUY'):
+                            final_decision = 'BUY'
+                            event_reason = 'AI 승인'
+                            log.info("✅ Decision: BUY")
+                            self._last_size_plan = self._prepare_position_plan(ai_payload)
+                        else:
+                            event_reason = 'AI 거절'
+                            log.info(f"❌ AI Ensemble REJECTED the BUY signal (AI said: {ai_decision}). Holding.")
+                            # 10개 캔들 쿨다운 설정
+                            self._set_ai_reject_cooldown(10)
 
                 # 매도 신호 처리
                 elif technical_signal == 'SELL' and self.in_position:
                     if self._sell_on_cooldown():
                         log.info("Sell signal suppressed due to cooldown")
                         event_reason = 'Cooldown'
+                        final_decision = 'HOLD'
+                    elif is_ai_cooling_down:
+                        log.info(f"Skipping AI check due to recent rejection (Cooldown until {time.strftime('%H:%M:%S', time.localtime(self._ai_reject_cooldown_end_ts))})")
+                        event_reason = 'AI 쿨다운'
                         final_decision = 'HOLD'
                     else:
                         log.info(f"📉 Technical Signal [SELL] detected! Asking AI Ensemble for confirmation...")
@@ -614,6 +631,8 @@ class TradingBot:
                         else:
                             event_reason = 'AI 거절'
                             log.info(f"❌ AI Ensemble REJECTED the SELL signal (AI said: {ai_decision}). Holding.")
+                            # 10개 캔들 쿨다운 설정
+                            self._set_ai_reject_cooldown(10)
 
                 # 4. 매매 실행
                 self._log_event_check(technical_signal, ai_payload, final_decision, event_reason, config_info)
@@ -776,6 +795,30 @@ class TradingBot:
         except Exception:
             pass
         return None
+
+    def _set_ai_reject_cooldown(self, candle_count: int):
+        """AI 거절 시 일정 캔들 개수만큼 쿨다운 시간을 설정한다."""
+        try:
+            tf_str = self.timeframe  # e.g., 'minute5', 'minute15', 'day'
+            minutes_per_candle = 1
+            if tf_str.startswith('minute'):
+                # 'minute5' -> 5
+                val_str = tf_str.replace('minute', '')
+                if val_str.isdigit():
+                    minutes_per_candle = int(val_str)
+            elif tf_str == 'day':
+                minutes_per_candle = 60 * 24
+            elif tf_str == 'week':
+                minutes_per_candle = 60 * 24 * 7
+            elif tf_str == 'month':
+                minutes_per_candle = 60 * 24 * 30
+
+            total_seconds = minutes_per_candle * 60 * candle_count
+            self._ai_reject_cooldown_end_ts = time.time() + total_seconds
+
+            log.info(f"❄️ AI Rejection Cooldown activated for {candle_count} candles ({minutes_per_candle} min/candle). Next AI check after {total_seconds/60:.1f} mins.")
+        except Exception as e:
+            log.warning(f"Failed to set AI reject cooldown: {e}")
 
     def _estimate_available_cash(self, ai_payload):
         ctx = (ai_payload or {}).get('context') or {}
