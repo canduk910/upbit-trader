@@ -557,6 +557,17 @@ class BaseWebsocketListener(abc.ABC):
         self._thread.start()
         self.logger.info("Websocket listener started.")
 
+    def run(self) -> None:
+        """Start the listener and block until it stops."""
+        self.start()
+        try:
+            while self._thread and self._thread.is_alive():
+                self._thread.join(timeout=1)
+        except KeyboardInterrupt:
+            self.logger.info("Websocket listener interrupted; stopping...")
+        finally:
+            self.stop()
+
     def stop(self) -> None:
         self._stop_event.set()
         if self._ws:

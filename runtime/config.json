@@ -17,14 +17,12 @@
   "strategy_params": {
     "VolatilityBreakout": {
       "k_value": 0.02,
-      "target_vol_pct": 30.0
+      "target_vol_pct": 20.0
     }
   },
   "ai_ensemble": {
     "strategy": "UNANIMOUS",
     "openai_model": "gpt-5-nano",
     "gemini_model": "gemini-2.5-flash"
-  },
-  "bot_enabled": false,
-  "bot_interval_sec": 5.0
+  }
 }
