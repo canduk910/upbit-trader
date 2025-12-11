@@ -26,7 +26,7 @@ except Exception:
 class TradingBot:
     def __init__(self):
         log.info("========== [Upbit Auto Trading Bot Started] ==========")
-        log.info(f"Market: {config.MARKET}, Strategy: {config.STRATEGY_NAME} + AI Ensemble ({config.ENSEMBLE_STRATEGY})")
+        log.info(f"Market: {config.MARKET}, Strategy: {config.STRATEGY_NAME}")
 
         # runtime config path for change detection
         self._config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'runtime', 'config.json')

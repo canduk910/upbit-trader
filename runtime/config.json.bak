@@ -24,5 +24,18 @@
     "strategy": "UNANIMOUS",
     "openai_model": "gpt-5-nano",
     "gemini_model": "gemini-2.5-flash"
-  }
+  },
+  "prefetch_count": 200,
+  "prefetch_interval_sec": 30,
+  "prefetch_batch_size": 5,
+  "prefetch_parallelism": 3,
+  "prefetch_sleep_sec": 0.2,
+  "prefetch_min_interval_sec": 60,
+  "prefetch_no_redis_max_count": 120,
+  "prefetch_rate_per_sec": 5.0,
+  "prefetch_rate_capacity": 5,
+  "prefetch_max_concurrent": 3,
+  "prefetch_token_wait_timeout": 10.0,
+  "KLINES_CACHE_TTL": 600,
+  "universe": []
 }

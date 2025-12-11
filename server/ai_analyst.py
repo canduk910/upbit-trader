@@ -4,6 +4,7 @@ import server.config as config
 from server.logger import log
 from server.history import ai_history_store
 from datetime import datetime, timezone, timedelta
+import math
 
 # OpenAI SDK
 # Defensive imports
@@ -593,27 +594,37 @@ class EnsembleAnalyzer:
             ai_history_store.record(result_payload)
             return result_payload
 
-        # 앙상블 전략 적용
-        # 1. 다수결 원칙 전략
-        # 양쪽 모델이 동일한 BUY 또는 SELL 신호를 낸 경우에만 해당 신호 채택
-        if config.ENSEMBLE_STRATEGY == 'MAJORITY':
-            if decision_openai == decision_gemini and decision_openai in ['BUY', 'SELL']:
-                final_decision = decision_openai
-                log.info(f"==> Consensus Reached: {final_decision}")
-            else:
-                log.info(
-                    f"==> Disagreement (OpenAI:{decision_openai} vs Gemini:{decision_gemini}). Result: HOLD"
-                )
-                final_reason.append('AI disagreement')
-        # 2. ANY 전략
-        # BUY 또는 SELL 신호가 하나라도 있으면 해당 신호 채택
-        elif config.ENSEMBLE_STRATEGY == 'ANY':
-            if 'BUY' in [decision_openai, decision_gemini]:
-                final_decision = 'BUY'
-                final_reason.append('AI any-strategy BUY override')
-            elif 'SELL' in [decision_openai, decision_gemini]:
-                final_decision = 'SELL'
-                final_reason.append('AI any-strategy SELL override')
+        def _ensemble_strategy(action: str) -> str:
+            strategy_map = {
+                'BUY': getattr(config, 'AI_ENS_BS', config.ENSEMBLE_STRATEGY).upper(),
+                'SELL': getattr(config, 'AI_ENS_SS', config.ENSEMBLE_STRATEGY).upper(),
+            }
+            return strategy_map.get(action, 'UNANIMOUS') or 'UNANIMOUS'
+
+        def _combo(action: str) -> bool:
+            if action not in ('BUY', 'SELL'):
+                return False
+            strategy = _ensemble_strategy(action)
+            votes = [decision_openai == action, decision_gemini == action]
+            conf_values = [self._extract_confidence(result_openai), self._extract_confidence(result_gemini)]
+            avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0
+            threshold = getattr(config, 'AI_ENS_AT', 0.5)
+            if strategy == 'UNANIMOUS':
+                return all(votes)
+            if strategy == 'AVERAGE':
+                return avg_conf >= threshold
+            if strategy == 'MAJORITY':
+                return sum(votes) >= sum(votes)//2
+            return False
+
+        if _combo('BUY'):
+            final_decision = 'BUY'
+            final_reason.append('AI ensemble BUY confirmation')
+        elif _combo('SELL'):
+            final_decision = 'SELL'
+            final_reason.append('AI ensemble SELL confirmation')
+        else:
+            final_reason.append('AI ensemble HOLD (no consensus)')
 
         final_reason.append(f"Final decision {final_decision}")
         primary_market = None

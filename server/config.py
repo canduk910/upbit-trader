@@ -47,6 +47,21 @@ def _migrate_config_schema(cfg: Dict[str, Any]) -> Dict[str, Any]:
             vb_params['target_vol_pct'] = 30.0
     if 'target_vol_pct' not in vb_params:
         vb_params['target_vol_pct'] = 30.0
+    ai_ensemble = normalized.setdefault('ai_ensemble', {}) if isinstance(normalized.get('ai_ensemble'), dict) else {}
+    base_strategy = str(ai_ensemble.get('strategy', 'UNANIMOUS')).upper()
+    buy_strategy = str(ai_ensemble.get('buy_strategy', '')).upper()
+    sell_strategy = str(ai_ensemble.get('sell_strategy', '')).upper()
+    if not buy_strategy:
+        buy_strategy = base_strategy
+    if not sell_strategy:
+        sell_strategy = base_strategy
+    ai_ensemble['buy_strategy'] = buy_strategy or 'UNANIMOUS'
+    ai_ensemble['sell_strategy'] = sell_strategy or 'UNANIMOUS'
+    try:
+        ai_ensemble['average_threshold'] = float(ai_ensemble.get('average_threshold', 0.5))
+    except (TypeError, ValueError):
+        ai_ensemble['average_threshold'] = 0.5
+    normalized['ai_ensemble'] = ai_ensemble
     return normalized
 
 
@@ -109,6 +124,7 @@ def _sync_globals_from_config(cfg: Dict[str, Any]):
     global VB_K_VALUE, VB_TARGET_VOL_PCT, DM_WINDOW
     global ENSEMBLE_STRATEGY, OPENAI_MODEL, GEMINI_MODEL
     global BOT_ENABLED, BOT_INTERVAL_SEC, BOT_SELL_COOLDOWN_SEC
+    global AI_ENS_BS, AI_ENS_SS, AI_ENS_AT
 
     STRATEGY_NAME = cfg.get("strategy_name", "RSI")
     MARKET = cfg.get("market", "KRW-BTC")
@@ -143,6 +159,9 @@ def _sync_globals_from_config(cfg: Dict[str, Any]):
     ENSEMBLE_STRATEGY = _ai_ensemble_settings.get("strategy", "UNANIMOUS")
     OPENAI_MODEL = _ai_ensemble_settings.get("openai_model", "gpt-5.1-nano")
     GEMINI_MODEL = _ai_ensemble_settings.get("gemini_model", "gemini-2.5-flash")
+    AI_ENS_BS = _ai_ensemble_settings.get("buy_strategy", ENSEMBLE_STRATEGY).upper()
+    AI_ENS_SS = _ai_ensemble_settings.get("sell_strategy", ENSEMBLE_STRATEGY).upper()
+    AI_ENS_AT = _ai_ensemble_settings.get("average_threshold", 0.5)
 
     bot_enabled = cfg.get("bot_enabled")
     if bot_enabled is None:
@@ -206,6 +225,9 @@ _ai_ensemble_settings = _config.get("ai_ensemble", {})
 ENSEMBLE_STRATEGY = _ai_ensemble_settings.get("strategy", "UNANIMOUS")
 OPENAI_MODEL = _ai_ensemble_settings.get("openai_model", "gpt-5.1-nano")
 GEMINI_MODEL = _ai_ensemble_settings.get("gemini_model", "gemini-2.5-flash")
+AI_ENS_BS = _ai_ensemble_settings.get("buy_strategy", ENSEMBLE_STRATEGY).upper()
+AI_ENS_SS = _ai_ensemble_settings.get("sell_strategy", ENSEMBLE_STRATEGY).upper()
+AI_ENS_AT = _ai_ensemble_settings.get("average_threshold", 0.5)
 
 BOT_ENABLED = _config.get("bot_enabled", True)
 BOT_INTERVAL_SEC = float(_config.get("bot_interval_sec", 5.0))

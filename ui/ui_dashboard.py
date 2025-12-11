@@ -54,6 +54,18 @@ def validate_config(cfg: Dict[str, Any]) -> Tuple[bool, str]:
     return True, ''
 
 
+def _refresh_config_cache() -> Dict[str, Any]:
+    cfg_data = load_config()
+    st.session_state['config_cache'] = cfg_data
+    return cfg_data
+
+
+def _get_active_config() -> Dict[str, Any]:
+    if 'config_cache' not in st.session_state:
+        return _refresh_config_cache()
+    return st.session_state['config_cache']
+
+
 RUNTIME_CONFIG = Path(__file__).resolve().parents[1] / 'runtime' / 'config.json'
 
 st.set_page_config(page_title='Upbit Trader', layout='wide')
@@ -429,16 +441,17 @@ def plot_candles_with_indicators(df: pd.DataFrame, ticker: str, ma_windows: list
 
 
 # Load existing config
-cfg = load_config()
+cfg = _get_active_config()
 
 # --- Page renderers ---
 
 def render_config_page(cfg_data: Dict[str, Any]):
     st.title('설정 편집')
 
+    cfg_snapshot = deepcopy(cfg_data) if isinstance(cfg_data, dict) else {}
     # Strategy selector placed outside the form so changes immediately re-render detail fields.
     _strategy_opts = ['VolatilityBreakout', 'DualMomentum', 'RSI']
-    _default = cfg_data.get('strategy_name', 'VolatilityBreakout')
+    _default = cfg_snapshot.get('strategy_name', 'VolatilityBreakout')
     try:
         _default_idx = _strategy_opts.index(_default) if _default in _strategy_opts else 0
     except Exception:
@@ -455,7 +468,7 @@ def render_config_page(cfg_data: Dict[str, Any]):
 
         # --- 전략별 상세 설정: 전략 선택 바로 아래에 위치하도록 함 ---
         st.caption('선택한 전략에 따라 여기서 세부 옵션을 정해요.')
-        strategy_params = cfg_data.get('strategy_params', {})
+        strategy_params = cfg_snapshot.get('strategy_params', {}) if isinstance(cfg_snapshot, dict) else {}
         if strategy_name == 'RSI':
             rsi = strategy_params.get('RSI', {})
             rsi_period = st.number_input('RSI 기간 (몇개 캔들로 계산할지)', min_value=1, value=int(rsi.get('period', 14)), help='RSI를 계산할 때 몇 개의 캔들을 볼지 정해요. 보통 14')
@@ -464,26 +477,26 @@ def render_config_page(cfg_data: Dict[str, Any]):
         elif strategy_name == 'VolatilityBreakout':
             vb = strategy_params.get('VolatilityBreakout', {})
             k_value = st.number_input('변동성 비율 k (0~1)', min_value=0.0, max_value=1.0, value=float(vb.get('k_value', 0.5)), help='지난 기간의 변동성에서 몇 퍼센트만큼 돌파를 보면 진입할지 정하는 수치예요. 0.5가 보통 사용됩니다.')
-            target_vol_pct_default = vb.get('target_vol_pct', cfg.get('vb_target_vol_pct', 30.0))
+            target_vol_pct_default = vb.get('target_vol_pct', cfg_snapshot.get('vb_target_vol_pct', 30.0))
             target_vol_pct = st.number_input('목표 변동성 비율 (%)', min_value=1.0, max_value=100.0, value=float(target_vol_pct_default), help='시장 변동성이 이 값 이상인지 보고 매매 여부를 판단해요.')
         elif strategy_name == 'DualMomentum':
             dm = strategy_params.get('DualMomentum', {})
             window = st.number_input('모멘텀 계산 창 길이', min_value=1, value=int(dm.get('window', 12)), help='모멘텀을 계산할 때 몇 기간을 볼지 정해요. 숫자가 크면 더 긴 흐름을 봐요.')
 
         # 기본 정보(전략 상세 바로 아래에 위치)
-        market = st.text_input('거래할 마켓 (예: KRW-BTC)', value=cfg_data.get('market', 'KRW-BTC'), help='어떤 코인을 거래할지 적어요. 예: KRW-BTC는 비트코인입니다.')
-        timeframe = st.text_input('캔들 시간 단위 (예: minute5)', value=cfg_data.get('timeframe', 'minute5'), help='한 개의 캔들이 몇 분/시간인지 적어요. 예: minute5 = 5분')
-        candle_count = st.number_input('캔들 개수(그래프 표시 길이)', min_value=1, value=int(cfg_data.get('candle_count', 200)), help='차트에 보여줄 과거 데이터의 개수예요. 숫자가 크면 긴 기간을 보여줘요.')
-        loop_interval_sec = st.number_input('루프 실행 간격(초)', min_value=1, value=int(cfg_data.get('loop_interval_sec', 5)), help='자동으로 확인할 때 몇 초마다 할지 정해요.')
+        market = st.text_input('거래할 마켓 (예: KRW-BTC)', value=cfg_snapshot.get('market', 'KRW-BTC'), help='어떤 코인을 거래할지 적어요. 예: KRW-BTC는 비트코인입니다.')
+        timeframe = st.text_input('캔들 시간 단위 (예: minute5)', value=cfg_snapshot.get('timeframe', 'minute5'), help='한 개의 캔들이 몇 분/시간인지 적어요. 예: minute5 = 5분')
+        candle_count = st.number_input('캔들 개수(그래프 표시 길이)', min_value=1, value=int(cfg_snapshot.get('candle_count', 200)), help='차트에 보여줄 과거 데이터의 개수예요. 숫자가 크면 긴 기간을 보여줘요.')
+        loop_interval_sec = st.number_input('루프 실행 간격(초)', min_value=1, value=int(cfg_snapshot.get('loop_interval_sec', 5)), help='자동으로 확인할 때 몇 초마다 할지 정해요.')
 
         st.subheader('주문 관련 설정 (돈/수량)')
-        order_settings = cfg_data.get('order_settings', {})
+        order_settings = cfg_snapshot.get('order_settings', {})
         min_order_amount = st.number_input('최소 주문 금액 (원)', min_value=1000, value=int(order_settings.get('min_order_amount', 5500)), help='거래소에서 허용하는 최소 주문 금액이에요. 이 값보다 작으면 주문 못해요.')
         trade_amount_krw = st.number_input('한 번 거래할 금액 (원)', min_value=1000, value=int(order_settings.get('trade_amount_krw', 6000)), help='한 번 매수할 때 쓰는 돈이에요. 예: 6000원')
 
         st.subheader('켈리공식 (돈을 얼마나 쓸지 계산하는 방법)')
-        use_kelly = st.checkbox('켈리공식 사용하기', value=bool(cfg_data.get('use_kelly_criterion', True)), help='켈리공식을 사용하면 이길 확률과 수익비율로 한 번에 투자할 돈을 계산해줘요.')
-        kelly = cfg_data.get('kelly_criterion', {})
+        use_kelly = st.checkbox('켈리공식 사용하기', value=bool(cfg_snapshot.get('use_kelly_criterion', True)), help='켈리공식을 사용하면 이길 확률과 수익비율로 한 번에 투자할 돈을 계산해줘요.')
+        kelly = cfg_snapshot.get('kelly_criterion', {})
         win_rate = st.number_input('승률 (0~1)', min_value=0.0, max_value=1.0, value=float(kelly.get('win_rate', 0.65)), help='거래했을 때 이길 확률을 0부터 1 사이로 적어요. 예: 0.65 = 65%')
         payoff_ratio = st.number_input('평균 이익/손실 비율', min_value=0.0, value=float(kelly.get('payoff_ratio', 1.2)), help='이길 때 평균 이익이 손실보다 몇 배인지 적어요. 예: 1.2면 이익이 손실의 1.2배')
         fraction = st.number_input('적용 비율 (0~1)', min_value=0.0, max_value=1.0, value=float(kelly.get('fraction', 0.5)), help='켈리로 계산한 금액 중 얼마만 실제로 쓸지 0~1로 적어요. 예: 0.5는 반만 사용')
@@ -492,32 +505,41 @@ def render_config_page(cfg_data: Dict[str, Any]):
 
         # --- Prefetch & Cache settings ---
         st.subheader('미리받기(캐시) 설정 — 서버가 데이터를 미리 모아놓는 방법')
-        prefetch_cfg = cfg_data.get('prefetch', {}) if isinstance(cfg_data.get('prefetch', {}), dict) else {}
+        prefetch_cfg = cfg_snapshot.get('prefetch', {}) if isinstance(cfg_snapshot.get('prefetch'), dict) else {}
         # Top-level prefetch keys (stored at root level, not inside 'prefetch' for backward compatibility)
-        prefetch_count = st.number_input('미리 받을 캔들 수 (종목당)', min_value=1, value=int(cfg_data.get('prefetch_count', cfg_data.get('candle_count', 200))), help='서버가 각 종목에서 미리 받아둘 캔들 수예요. 그래프 길이에 영향을 줍니다.')
-        prefetch_interval_sec = st.number_input('미리수집 반복 간격(초)', min_value=1, value=int(cfg_data.get('prefetch_interval_sec', 30)), help='서버가 미리 데이터를 모으는 간격이에요. 숫자가 작으면 더 자주 업데이트합니다.')
-        prefetch_batch_size = st.number_input('한번에 모을 종목 수', min_value=1, value=int(cfg_data.get('prefetch_batch_size', 5)), help='한 번에 몇 종목씩 모을지 정해요. 너무 크면 호출이 몰려서 실패할 수 있어요.')
-        prefetch_parallelism = st.number_input('동시 작업 수(스레드)', min_value=1, value=int(cfg_data.get('prefetch_parallelism', 3)), help='몇 개의 작업을 동시에 실행할지 정해요. 숫자가 크면 빨라지지만 컴퓨터에 부담이 들어요.')
-        prefetch_sleep_sec = st.number_input('종목 사이 쉬는 시간(초)', min_value=0.0, value=float(cfg_data.get('prefetch_sleep_sec', 0.2)), help='한 종목을 처리한 뒤 잠깐 쉬는 시간이에요. 서버 과부하를 줄여요.')
-        prefetch_min_interval_sec = st.number_input('Redis 없을 때 최소 간격(초)', min_value=1, value=int(cfg_data.get('prefetch_min_interval_sec', 60)), help='Redis가 없으면 미리받기 사이 간격을 더 길게 해요.')
-        prefetch_no_redis_max_count = st.number_input('Redis 없을 때 최대 캔들 수', min_value=1, value=int(cfg_data.get('prefetch_no_redis_max_count', 120)), help='Redis가 없을 때는 너무 많이 가져오지 않도록 제한해요.')
-        prefetch_rate_per_sec = st.number_input('초당 허용 호출(토큰)', min_value=0.0, value=float(cfg_data.get('prefetch_rate_per_sec', 5)), help='초당 몇 번의 호출을 허용할지 토큰으로 정해요.')
-        prefetch_rate_capacity = st.number_input('버스트 허용 토큰(추가 여유)', min_value=1, value=int(cfg_data.get('prefetch_rate_capacity', int(prefetch_rate_per_sec or 1))), help='잠깐 동안 더 많은 호출을 허용할 수 있는 여유량이에요.')
-        prefetch_max_concurrent = st.number_input('최대 동시 작업 수', min_value=1, value=int(cfg_data.get('prefetch_max_concurrent', 3)), help='한 번에 병렬로 수행할 최대 작업 수예요.')
-        prefetch_token_wait_timeout = st.number_input('토큰 대기 최대 시간(초)', min_value=0.0, value=float(cfg_data.get('prefetch_token_wait_timeout', 10.0)), help='토큰을 기다리는 최대 시간이에요. 너무 작으면 실패할 수 있어요.')
+        prefetch_count = st.number_input('미리 받을 캔들 수 (종목당)', min_value=1, value=int(cfg_snapshot.get('prefetch_count', cfg_snapshot.get('candle_count', 200))), help='서버가 각 종목에서 미리 받아둘 캔들 수예요. 그래프 길이에 영향을 줍니다.')
+        prefetch_interval_sec = st.number_input('미리수집 반복 간격(초)', min_value=1, value=int(cfg_snapshot.get('prefetch_interval_sec', 30)), help='서버가 미리 데이터를 모으는 간격이에요. 숫자가 작으면 더 자주 업데이트합니다.')
+        prefetch_batch_size = st.number_input('한번에 모을 종목 수', min_value=1, value=int(cfg_snapshot.get('prefetch_batch_size', 5)), help='한 번에 몇 종목씩 모을지 정해요. 너무 크면 호출이 몰려서 실패할 수 있어요.')
+        prefetch_parallelism = st.number_input('동시 작업 수(스레드)', min_value=1, value=int(cfg_snapshot.get('prefetch_parallelism', 3)), help='몇 개의 작업을 동시에 실행할지 정해요. 숫자가 크면 빨라지지만 컴퓨터에 부담이 들어요.')
+        prefetch_sleep_sec = st.number_input('종목 사이 쉬는 시간(초)', min_value=0.0, value=float(cfg_snapshot.get('prefetch_sleep_sec', 0.2)), help='한 종목을 처리한 뒤 잠깐 쉬는 시간이에요. 서버 과부하를 줄여요.')
+        prefetch_min_interval_sec = st.number_input('Redis 없을 때 최소 간격(초)', min_value=1, value=int(cfg_snapshot.get('prefetch_min_interval_sec', 60)), help='Redis가 없으면 미리받기 사이 간격을 더 길게 해요.')
+        prefetch_no_redis_max_count = st.number_input('Redis 없을 때 최대 캔들 수', min_value=1, value=int(cfg_snapshot.get('prefetch_no_redis_max_count', 120)), help='Redis가 없을 때는 너무 많이 가져오지 않도록 제한해요.')
+        prefetch_rate_per_sec = st.number_input('초당 허용 호출(토큰)', min_value=0.0, value=float(cfg_snapshot.get('prefetch_rate_per_sec', 5)), help='초당 몇 번의 호출을 허용할지 토큰으로 정해요.')
+        prefetch_rate_capacity = st.number_input('버스트 허용 토큰(추가 여유)', min_value=1, value=int(cfg_snapshot.get('prefetch_rate_capacity', int(prefetch_rate_per_sec or 1))), help='잠깐 동안 더 많은 호출을 허용할 수 있는 여유량이에요.')
+        prefetch_max_concurrent = st.number_input('최대 동시 작업 수', min_value=1, value=int(cfg_snapshot.get('prefetch_max_concurrent', 3)), help='한 번에 병렬로 수행할 최대 작업 수예요.')
+        prefetch_token_wait_timeout = st.number_input('토큰 대기 최대 시간(초)', min_value=0.0, value=float(cfg_snapshot.get('prefetch_token_wait_timeout', 10.0)), help='토큰을 기다리는 최대 시간이에요. 너무 작으면 실패할 수 있어요.')
         # Cache TTL
-        klines_cache_ttl = st.number_input('차트 데이터 캐시 유지시간(초)', min_value=1, value=int(cfg_data.get('KLINES_CACHE_TTL', os.getenv('KLINES_CACHE_TTL', '600'))), help='서버가 저장해두는 데이터가 얼마나 오래 유지될지 초 단위로 적어요.')
+        klines_cache_ttl = st.number_input('차트 데이터 캐시 유지시간(초)', min_value=1, value=int(cfg_snapshot.get('KLINES_CACHE_TTL', os.getenv('KLINES_CACHE_TTL', '600'))), help='서버가 저장해두는 데이터가 얼마나 오래 유지될지 초 단위로 적어요.')
 
         # AI ensemble settings
         st.subheader('AI 조합 방법 (여러 AI를 어떻게 합칠까?)')
-        ai_ensemble = cfg_data.get('ai_ensemble', {}) if isinstance(cfg_data.get('ai_ensemble', {}), dict) else {}
-        ai_strategy = st.selectbox('AI 합치는 방식', options=['UNANIMOUS', 'MAJORITY', 'AVERAGE'], index=0 if ai_ensemble.get('strategy') is None else ['UNANIMOUS','MAJORITY','AVERAGE'].index(ai_ensemble.get('strategy', 'UNANIMOUS')), help='여러 AI가 모두 같은 의견일 때만 따를지(UNANIMOUS), 과반수 의견을 따를지(MAJORITY), 평균을 낼지(AVERAGE) 골라요.')
-        openai_model = st.text_input('OpenAI 모델 이름', value=ai_ensemble.get('openai_model', cfg.get('OPENAI_MODEL', 'gpt-5.1-nano')), help='OpenAI에서 사용할 모델 이름을 적어요. 특별히 모르면 기본값 그대로 두세요.')
-        gemini_model = st.text_input('Gemini 모델 이름', value=ai_ensemble.get('gemini_model', cfg.get('GEMINI_MODEL', 'gemini-2.5-flash')), help='Gemini에서 사용할 모델 이름을 적어요. 모르면 기본값 사용')
+        ai_ensemble = cfg_snapshot.get('ai_ensemble', {}) if isinstance(cfg_snapshot.get('ai_ensemble', {}), dict) else {}
+        ai_strategy_opts = ['UNANIMOUS', 'MAJORITY', 'AVERAGE']
+        current_ai_strategy = ai_ensemble.get('strategy', 'UNANIMOUS')
+        try:
+            ai_strategy_idx = ai_strategy_opts.index(current_ai_strategy)
+        except ValueError:
+            ai_strategy_idx = 0
+        ai_strategy = st.selectbox('AI 합치는 방식', options=ai_strategy_opts, index=ai_strategy_idx, help='여러 AI가 모두 같은 의견일 때만 따를지(UNANIMOUS), 과반수 의견을 따를지(MAJORITY), 평균을 낼지(AVERAGE) 골라요.')
+        buy_strategy = st.selectbox('매수 시 적용할 전략', options=ai_strategy_opts, index=ai_strategy_opts.index(ai_ensemble.get('buy_strategy', ai_strategy)), help='매수 결정을 내릴 때 사용할 앙상블 방식입니다.')
+        sell_strategy = st.selectbox('매도 시 적용할 전략', options=ai_strategy_opts, index=ai_strategy_opts.index(ai_ensemble.get('sell_strategy', ai_strategy)), help='매도 결정을 내릴 때 사용할 앙상블 방식입니다.')
+        average_threshold = st.slider('AVERAGE 전략 기준 신뢰도', min_value=0.0, max_value=1.0, value=float(ai_ensemble.get('average_threshold', 0.5)), step=0.05, help='AVERAGE 전략 선택 시 두 모델의 신뢰도 평균이 이 값 이상일 때만 실행합니다.')
+        openai_model = st.text_input('OpenAI 모델 이름', value=ai_ensemble.get('openai_model', cfg_snapshot.get('OPENAI_MODEL', 'gpt-5.1-nano')), help='OpenAI에서 사용할 모델 이름을 적어요. 특별히 모르면 기본값 그대로 두세요.')
+        gemini_model = st.text_input('Gemini 모델 이름', value=ai_ensemble.get('gemini_model', cfg_snapshot.get('GEMINI_MODEL', 'gemini-2.5-flash')), help='Gemini에서 사용할 모델 이름을 적어요. 모르면 기본값 사용')
 
         # Universe (comma separated tickers)
         st.subheader('관심 종목 목록 (우리가 볼 종목들)')
-        universe_list = cfg_data.get('universe')
+        universe_list = cfg_snapshot.get('universe')
         if isinstance(universe_list, list):
             universe_str = ','.join(universe_list)
         else:
@@ -527,73 +549,74 @@ def render_config_page(cfg_data: Dict[str, Any]):
     if form_submitted:
         st.success('입력값이 최신 상태로 갱신됐어요. 아래 "로컬에 저장" 또는 "서버에 전송" 버튼으로 적용을 완료해 주세요.')
 
-    new_cfg = {
-        'strategy_name': strategy_name,
-        'market': market,
-        'timeframe': timeframe,
-        'candle_count': candle_count,
-        'loop_interval_sec': loop_interval_sec,
-        'order_settings': {
-            'min_order_amount': min_order_amount,
-            'trade_amount_krw': trade_amount_krw,
-        },
-        'use_kelly_criterion': use_kelly,
-        'kelly_criterion': {
-            'win_rate': win_rate,
-            'payoff_ratio': payoff_ratio,
-            'fraction': fraction,
-        },
-        'strategy_params': {}
-    }
+    if not isinstance(cfg_snapshot, dict):
+        base_cfg = {}
+    else:
+        base_cfg = deepcopy(cfg_snapshot)
 
-    base_cfg = deepcopy(cfg_data) if isinstance(cfg_data, dict) else {}
-    new_cfg = base_cfg if base_cfg else {}
+    new_cfg = deepcopy(base_cfg)
     new_cfg.update({
         'strategy_name': strategy_name,
         'market': market,
         'timeframe': timeframe,
-        'candle_count': candle_count,
-        'loop_interval_sec': loop_interval_sec,
+        'candle_count': int(candle_count),
+        'loop_interval_sec': int(loop_interval_sec),
         'order_settings': {
-            'min_order_amount': min_order_amount,
-            'trade_amount_krw': trade_amount_krw,
+            'min_order_amount': int(min_order_amount),
+            'trade_amount_krw': int(trade_amount_krw),
         },
-        'use_kelly_criterion': use_kelly,
+        'use_kelly_criterion': bool(use_kelly),
         'kelly_criterion': {
-            'win_rate': win_rate,
-            'payoff_ratio': payoff_ratio,
-            'fraction': fraction,
+            'win_rate': float(win_rate),
+            'payoff_ratio': float(payoff_ratio),
+            'fraction': float(fraction),
         },
     })
-    new_cfg['strategy_params'] = {}
+
+    new_cfg['strategy_params'] = new_cfg.get('strategy_params', {})
     if strategy_name == 'RSI':
         new_cfg['strategy_params']['RSI'] = {
-            'period': rsi_period,
-            'oversold': rsi_oversold,
-            'overbought': rsi_overbought,
+            'period': int(rsi_period),
+            'oversold': int(rsi_oversold),
+            'overbought': int(rsi_overbought),
         }
     elif strategy_name == 'VolatilityBreakout':
         new_cfg['strategy_params']['VolatilityBreakout'] = {
-            'k_value': k_value,
-            'target_vol_pct': target_vol_pct,
+            'k_value': float(k_value),
+            'target_vol_pct': float(target_vol_pct),
         }
     elif strategy_name == 'DualMomentum':
-        new_cfg['strategy_params']['DualMomentum'] = {'window': window}
+        new_cfg['strategy_params']['DualMomentum'] = {'window': int(window)}
 
-    # attach AI ensemble and universe
+    new_cfg.update({
+        'prefetch_count': int(prefetch_count),
+        'prefetch_interval_sec': int(prefetch_interval_sec),
+        'prefetch_batch_size': int(prefetch_batch_size),
+        'prefetch_parallelism': int(prefetch_parallelism),
+        'prefetch_sleep_sec': float(prefetch_sleep_sec),
+        'prefetch_min_interval_sec': int(prefetch_min_interval_sec),
+        'prefetch_no_redis_max_count': int(prefetch_no_redis_max_count),
+        'prefetch_rate_per_sec': float(prefetch_rate_per_sec),
+        'prefetch_rate_capacity': int(prefetch_rate_capacity),
+        'prefetch_max_concurrent': int(prefetch_max_concurrent),
+        'prefetch_token_wait_timeout': float(prefetch_token_wait_timeout),
+        'KLINES_CACHE_TTL': int(klines_cache_ttl),
+    })
+
     new_cfg['ai_ensemble'] = {
         'strategy': ai_strategy,
+        'buy_strategy': buy_strategy,
+        'sell_strategy': sell_strategy,
+        'average_threshold': float(average_threshold),
         'openai_model': openai_model,
         'gemini_model': gemini_model,
     }
-    # parse universe string into list
+
     universe_parsed = [s.strip() for s in universe_input.split(',') if s.strip()]
     if universe_parsed:
         new_cfg['universe'] = universe_parsed
-    else:
-        # keep existing if empty
-        if isinstance(cfg.get('universe'), list):
-            new_cfg['universe'] = cfg.get('universe')
+    elif 'universe' not in new_cfg:
+        new_cfg['universe'] = []
 
     st.divider()
     st.header('설정 액션')
@@ -610,7 +633,7 @@ def render_config_page(cfg_data: Dict[str, Any]):
                 try:
                     if save_local(new_cfg):
                         st.success('저장 완료: runtime/config.json')
-                        st.session_state['config_cache'] = load_config()
+                        _refresh_config_cache()
                         st.rerun()
                     else:
                         st.error('로컬 저장 실패: 저장 함수에서 False가 반환되었습니다.')
