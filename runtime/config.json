@@ -21,10 +21,17 @@
     }
   },
   "ai_ensemble": {
-    "strategy": "UNANIMOUS",
+    "strategy": "MAJORITY",
+    "buy_strategy": "MAJORITY",
+    "sell_strategy": "MAJORITY",
+    "average_threshold": 0.5,
     "openai_model": "gpt-5-nano",
     "gemini_model": "gemini-2.5-flash"
   },
+  "bot_enabled": true,
+  "bot_interval_sec": 5,
+  "bot_sell_cooldown_sec": 60,
+  "ai_reject_cooldown_candles": 3,
   "prefetch_count": 200,
   "prefetch_interval_sec": 30,
   "prefetch_batch_size": 5,

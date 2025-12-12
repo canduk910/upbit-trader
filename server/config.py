@@ -118,13 +118,14 @@ def _sync_globals_from_config(cfg: Dict[str, Any]):
     이 함수는 `reload_config()` 호출 시 기존 전역 변수들이 최신 값으로 갱신되도록 보장합니다.
     """
     global STRATEGY_NAME, MARKET, TIMEFRAME, CANDLE_COUNT, LOOP_INTERVAL_SEC
-    global MIN_ORDER_AMOUNT, TRADE_AMOUNT_KRW
+    global MIN_ORDER_AMOUNT, TRADE_AMOUNT_KRW, SELL_RATIO
     global USE_KELLY_CRITERION, KELLY_WIN_RATE, KELLY_PAYOFF_RATIO, KELLY_FRACTION
     global RSI_PERIOD, RSI_OVERSOLD, RSI_OVERBOUGHT
     global VB_K_VALUE, VB_TARGET_VOL_PCT, DM_WINDOW
     global ENSEMBLE_STRATEGY, OPENAI_MODEL, GEMINI_MODEL
     global BOT_ENABLED, BOT_INTERVAL_SEC, BOT_SELL_COOLDOWN_SEC
     global AI_ENS_BS, AI_ENS_SS, AI_ENS_AT
+    global AI_REJECT_COOLDOWN_CANDLES
 
     STRATEGY_NAME = cfg.get("strategy_name", "RSI")
     MARKET = cfg.get("market", "KRW-BTC")
@@ -135,6 +136,7 @@ def _sync_globals_from_config(cfg: Dict[str, Any]):
     _order_settings = cfg.get("order_settings", {})
     MIN_ORDER_AMOUNT = _order_settings.get("min_order_amount", 5500)
     TRADE_AMOUNT_KRW = _order_settings.get("trade_amount_krw", 6000)
+    SELL_RATIO = _order_settings.get("sell_ratio", 0.3)
 
     USE_KELLY_CRITERION = cfg.get("use_kelly_criterion", False)
     _kelly_settings = cfg.get("kelly_criterion", {})
@@ -169,6 +171,7 @@ def _sync_globals_from_config(cfg: Dict[str, Any]):
     BOT_ENABLED = bool(bot_enabled)
     BOT_INTERVAL_SEC = float(cfg.get("bot_interval_sec", 5.0))
     BOT_SELL_COOLDOWN_SEC = float(cfg.get("bot_sell_cooldown_sec", 120.0))
+    AI_REJECT_COOLDOWN_CANDLES = int(cfg.get("ai_reject_cooldown_candles", 3))
 
 
 # 초기 로드 이후 전역 변수 동기화
@@ -201,6 +204,7 @@ LOOP_INTERVAL_SEC = _config.get("loop_interval_sec", 5)
 _order_settings = _config.get("order_settings", {})
 MIN_ORDER_AMOUNT = _order_settings.get("min_order_amount", 5500)
 TRADE_AMOUNT_KRW = _order_settings.get("trade_amount_krw", 6000)
+SELL_RATIO = _order_settings.get("sell_ratio", 0.3)  # 매도 시 전체 잔고의 30%만 매도
 
 USE_KELLY_CRITERION = _config.get("use_kelly_criterion", False)
 _kelly_settings = _config.get("kelly_criterion", {})

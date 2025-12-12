@@ -609,12 +609,17 @@ class EnsembleAnalyzer:
             conf_values = [self._extract_confidence(result_openai), self._extract_confidence(result_gemini)]
             avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0
             threshold = getattr(config, 'AI_ENS_AT', 0.5)
+            num_votes = sum(votes)
+            total_models = len(votes)
             if strategy == 'UNANIMOUS':
                 return all(votes)
             if strategy == 'AVERAGE':
                 return avg_conf >= threshold
             if strategy == 'MAJORITY':
-                return sum(votes) >= sum(votes)//2
+                # 과반수 이상이면 통과 (2개 모델 중 1개 이상이면 OK)
+                # ceil(total/2) = 과반수 기준
+                majority_threshold = (total_models + 1) // 2  # 2개면 1개 필요, 3개면 2개 필요
+                return num_votes >= majority_threshold
             return False
 
         if _combo('BUY'):

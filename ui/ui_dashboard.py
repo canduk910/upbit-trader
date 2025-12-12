@@ -40,6 +40,9 @@ def validate_config(cfg: Dict[str, Any]) -> Tuple[bool, str]:
     order = cfg.get('order_settings', {})
     if not isinstance(order.get('trade_amount_krw', 0), (int, float)) or order.get('trade_amount_krw', 0) <= 0:
         return False, 'Trade amount_krw 는 0보다 큰 숫자여야 합니다.'
+    sell_ratio = order.get('sell_ratio', 0.3)
+    if not isinstance(sell_ratio, (int, float)) or not (0.1 <= sell_ratio <= 1.0):
+        return False, 'sell_ratio는 0.1~1.0 범위의 숫자여야 합니다.'
     kelly = cfg.get('kelly_criterion', {})
     if cfg.get('use_kelly_criterion'):
         wr = float(kelly.get('win_rate', 0))
@@ -212,7 +215,12 @@ def _format_ws_trade_timestamp(payload: Dict[str, Any]) -> str:
         if ts is None:
             return '-'
         tsf = float(ts) / 1000.0 if ts > 1e12 else float(ts)
-        return pd.to_datetime(tsf, unit='s').strftime('%H:%M:%S')
+        dt = pd.to_datetime(tsf, unit='s', utc=True)
+        try:
+            dt = dt.tz_convert('Asia/Seoul')
+        except Exception:
+            dt = dt.tz_localize('Asia/Seoul', ambiguous='NaT', nonexistent='shift_forward')
+        return dt.strftime('%H:%M:%S')
     except Exception:
         return '-'
 
@@ -287,7 +295,11 @@ def fetch_klines_batch_from_backend(tickers: list[str], timeframe: str = 'minute
             cols = [c for c in ['time','open','high','low','close','volume'] if c in df.columns]
             df = df[cols]
             if 'time' in df.columns:
-                df['time'] = pd.to_datetime(df['time'])
+                df['time'] = pd.to_datetime(df['time'], utc=True)
+                try:
+                    df['time'] = df['time'].dt.tz_convert('Asia/Seoul')
+                except Exception:
+                    df['time'] = df['time'].dt.tz_localize('Asia/Seoul', ambiguous='NaT', nonexistent='shift_forward')
             for col in ['open','high','low','close','volume']:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -354,12 +366,20 @@ def _normalize_klines_df(df: pd.DataFrame | None, min_length: int = 30) -> pd.Da
     if 'time' not in df.columns:
         return None
 
-    # time -> datetime
+    # time -> datetime with Asia/Seoul timezone
     try:
-        df['time'] = pd.to_datetime(df['time'])
+        df['time'] = pd.to_datetime(df['time'], utc=True)
+        try:
+            df['time'] = df['time'].dt.tz_convert('Asia/Seoul')
+        except Exception:
+            df['time'] = df['time'].dt.tz_localize('Asia/Seoul', ambiguous='NaT', nonexistent='shift_forward')
     except Exception:
         try:
-            df['time'] = pd.to_datetime(df['time'].astype(str))
+            df['time'] = pd.to_datetime(df['time'].astype(str), utc=True)
+            try:
+                df['time'] = df['time'].dt.tz_convert('Asia/Seoul')
+            except Exception:
+                df['time'] = df['time'].dt.tz_localize('Asia/Seoul', ambiguous='NaT', nonexistent='shift_forward')
         except Exception:
             return None
 
@@ -493,6 +513,7 @@ def render_config_page(cfg_data: Dict[str, Any]):
         order_settings = cfg_snapshot.get('order_settings', {})
         min_order_amount = st.number_input('최소 주문 금액 (원)', min_value=1000, value=int(order_settings.get('min_order_amount', 5500)), help='거래소에서 허용하는 최소 주문 금액이에요. 이 값보다 작으면 주문 못해요.')
         trade_amount_krw = st.number_input('한 번 거래할 금액 (원)', min_value=1000, value=int(order_settings.get('trade_amount_krw', 6000)), help='한 번 매수할 때 쓰는 돈이에요. 예: 6000원')
+        sell_ratio = st.slider('매도 비율 (0.1~1.0)', min_value=0.1, max_value=1.0, value=float(order_settings.get('sell_ratio', 0.3)), step=0.1, help='매도 신호가 나왔을 때 전체 잔고 중 몇 %를 매도할지 정해요. 0.3=30%, 1.0=전량 매도')
 
         st.subheader('켈리공식 (돈을 얼마나 쓸지 계산하는 방법)')
         use_kelly = st.checkbox('켈리공식 사용하기', value=bool(cfg_snapshot.get('use_kelly_criterion', True)), help='켈리공식을 사용하면 이길 확률과 수익비율로 한 번에 투자할 돈을 계산해줘요.')
@@ -534,8 +555,15 @@ def render_config_page(cfg_data: Dict[str, Any]):
         buy_strategy = st.selectbox('매수 시 적용할 전략', options=ai_strategy_opts, index=ai_strategy_opts.index(ai_ensemble.get('buy_strategy', ai_strategy)), help='매수 결정을 내릴 때 사용할 앙상블 방식입니다.')
         sell_strategy = st.selectbox('매도 시 적용할 전략', options=ai_strategy_opts, index=ai_strategy_opts.index(ai_ensemble.get('sell_strategy', ai_strategy)), help='매도 결정을 내릴 때 사용할 앙상블 방식입니다.')
         average_threshold = st.slider('AVERAGE 전략 기준 신뢰도', min_value=0.0, max_value=1.0, value=float(ai_ensemble.get('average_threshold', 0.5)), step=0.05, help='AVERAGE 전략 선택 시 두 모델의 신뢰도 평균이 이 값 이상일 때만 실행합니다.')
+        ai_reject_cooldown_candles = st.number_input('AI 거절 후 쿨다운 캔들 수', min_value=0, value=int(ai_ensemble.get('ai_reject_cooldown_candles', 3)), help='AI가 매매 신호를 거절하면 몇 개 캔들동안 다시 AI에게 물어보지 않을지 정해요. 0이면 바로 재시도합니다.')
         openai_model = st.text_input('OpenAI 모델 이름', value=ai_ensemble.get('openai_model', cfg_snapshot.get('OPENAI_MODEL', 'gpt-5.1-nano')), help='OpenAI에서 사용할 모델 이름을 적어요. 특별히 모르면 기본값 그대로 두세요.')
         gemini_model = st.text_input('Gemini 모델 이름', value=ai_ensemble.get('gemini_model', cfg_snapshot.get('GEMINI_MODEL', 'gemini-2.5-flash')), help='Gemini에서 사용할 모델 이름을 적어요. 모르면 기본값 사용')
+
+        # Bot control settings
+        st.subheader('봇 제어 설정 (자동매매 봇 동작 제어)')
+        bot_enabled = st.checkbox('자동매매 봇 활성화', value=bool(cfg_snapshot.get('bot_enabled', True)), help='체크하면 봇이 자동으로 매매를 시도합니다. 해제하면 봇이 일시정지됩니다.')
+        bot_interval_sec = st.number_input('봇 체크 주기 (초)', min_value=1, value=int(cfg_snapshot.get('bot_interval_sec', loop_interval_sec)), help='봇이 몇 초마다 시장을 확인할지 정해요. 기본은 루프 간격과 동일합니다.')
+        bot_sell_cooldown_sec = st.number_input('매도 후 쿨다운 시간 (초)', min_value=0, value=int(cfg_snapshot.get('bot_sell_cooldown_sec', 120)), help='매도 후 다시 매도 신호가 나와도 이 시간동안은 무시합니다. 0이면 쿨다운 없음.')
 
         # Universe (comma separated tickers)
         st.subheader('관심 종목 목록 (우리가 볼 종목들)')
@@ -564,6 +592,7 @@ def render_config_page(cfg_data: Dict[str, Any]):
         'order_settings': {
             'min_order_amount': int(min_order_amount),
             'trade_amount_krw': int(trade_amount_krw),
+            'sell_ratio': float(sell_ratio),
         },
         'use_kelly_criterion': bool(use_kelly),
         'kelly_criterion': {
@@ -608,9 +637,15 @@ def render_config_page(cfg_data: Dict[str, Any]):
         'buy_strategy': buy_strategy,
         'sell_strategy': sell_strategy,
         'average_threshold': float(average_threshold),
+        'ai_reject_cooldown_candles': int(ai_reject_cooldown_candles),
         'openai_model': openai_model,
         'gemini_model': gemini_model,
     }
+
+    # Bot control settings
+    new_cfg['bot_enabled'] = bool(bot_enabled)
+    new_cfg['bot_interval_sec'] = int(bot_interval_sec)
+    new_cfg['bot_sell_cooldown_sec'] = int(bot_sell_cooldown_sec)
 
     universe_parsed = [s.strip() for s in universe_input.split(',') if s.strip()]
     if universe_parsed:
@@ -765,14 +800,30 @@ def render_ws_monitoring_page():
     elif executions and isinstance(executions.get('executions'), list):
         data = executions['executions']
         for entry in sorted(data, key=lambda e: e.get('ts', 0), reverse=True):
-            exec_table.append({
+            profit_loss = entry.get('profit_loss')
+            profit_loss_pct = entry.get('profit_loss_pct')
+
+            row = {
                 '시간': _format_ws_ts(entry.get('ts')),
                 '심볼': entry.get('symbol') or '-',
                 '사이드': entry.get('side') or entry.get('ask_bid') or '-',
                 '체결가': entry.get('price') or entry.get('order_price') or '-',
                 '수량': entry.get('size') or entry.get('trade_volume') or '-',
-                '장부가': entry.get('entry_price') or '-',
-            })
+                '진입가': entry.get('entry_price') or '-',
+            }
+
+            # 손익 정보가 있으면 추가
+            if profit_loss is not None:
+                row['손익(KRW)'] = f"{profit_loss:+,.2f}"
+            else:
+                row['손익(KRW)'] = '-'
+
+            if profit_loss_pct is not None:
+                row['손익(%)'] = f"{profit_loss_pct:+.2f}%"
+            else:
+                row['손익(%)'] = '-'
+
+            exec_table.append(row)
     if exec_table:
         try:
             df_exec = pd.DataFrame(exec_table)
@@ -1433,21 +1484,103 @@ def render_ai_report_page():
         st.json(context_payload)
 
     st.subheader('4) 자문 히스토리')
+    st.caption('행을 클릭하면 아래에서 상세 내역을 확인할 수 있습니다.')
+
+    # 히스토리 테이블 생성 (역순으로 표시)
     history_rows = []
-    for item in reversed(items):
+    reversed_items = list(reversed(items))
+    for idx, item in enumerate(reversed_items):
         history_openai = _get_ai_source_payload(item, 'openai')
         history_gemini = _get_ai_source_payload(item, 'gemini')
         history_rows.append({
+            '선택': idx,
             '시각(KST)': _format_ts_kst(item.get('ts')),
             '최종 결정': item.get('decision'),
-            '사유': item.get('reason'),
+            '사유': (item.get('reason') or '')[:50] + '...' if len(item.get('reason') or '') > 50 else (item.get('reason') or '-'),
             'OpenAI': history_openai.get('decision') if history_openai else '-',
             'OpenAI 신뢰도': _format_confidence(_get_ai_confidence(history_openai)) if history_openai else '-',
             'Gemini': history_gemini.get('decision') if history_gemini else '-',
             'Gemini 신뢰도': _format_confidence(_get_ai_confidence(history_gemini)) if history_gemini else '-',
         })
+
     df_history = pd.DataFrame(history_rows)
-    _safe_dataframe(df_history.fillna('-'), hide_index=True)
+
+    # 데이터프레임 표시 및 행 선택
+    event = st.dataframe(
+        df_history.fillna('-'),
+        hide_index=True,
+        on_select='rerun',
+        selection_mode='single-row',
+        use_container_width=True,
+    )
+
+    # 선택된 행이 있으면 상세 내역 표시
+    if event and hasattr(event, 'selection') and event.selection and event.selection.get('rows'):
+        selected_idx = event.selection['rows'][0]
+        selected_item = reversed_items[selected_idx]
+
+        st.divider()
+        st.subheader('📋 선택한 자문 상세 내역')
+
+        # 두 컬럼으로 OpenAI와 Gemini 상세 내역 표시
+        detail_cols = st.columns(2, gap='large')
+
+        selected_openai = _get_ai_source_payload(selected_item, 'openai')
+        selected_gemini = _get_ai_source_payload(selected_item, 'gemini')
+
+        def _render_detailed_card(col, label: str, payload: Dict[str, Any] | None):
+            with col:
+                st.markdown(f"#### {label}")
+                if not payload:
+                    st.info('데이터 없음')
+                    return
+
+                decision = payload.get('decision') or payload.get('action') or 'N/A'
+                confidence = _get_ai_confidence(payload)
+
+                col_metrics = st.columns(2)
+                col_metrics[0].metric('결정', decision)
+                if confidence is not None:
+                    col_metrics[1].metric('신뢰도', _format_confidence(confidence))
+
+                st.caption(f"모델: {payload.get('model', '-')}")
+
+                # 상세 이유 표시
+                reason = payload.get('reason') or payload.get('reasoning')
+                if reason:
+                    st.markdown('**결정 근거:**')
+                    st.write(reason)
+
+                # 가격 계획 표시
+                raw_data = payload.get('raw')
+                if raw_data and isinstance(raw_data, dict):
+                    decisions = raw_data.get('decisions')
+                    if decisions and isinstance(decisions, list) and len(decisions) > 0:
+                        decision_detail = decisions[0]
+                        risk_mgmt = decision_detail.get('risk_management')
+                        if risk_mgmt:
+                            st.markdown('**리스크 관리:**')
+                            if risk_mgmt.get('stop_loss'):
+                                st.write(f"• 손절: {risk_mgmt['stop_loss']}")
+                            if risk_mgmt.get('take_profit'):
+                                st.write(f"• 익절: {risk_mgmt['take_profit']}")
+                            if risk_mgmt.get('notes'):
+                                st.caption(risk_mgmt['notes'])
+
+                # JSON 원문
+                with st.expander('전체 JSON 보기', expanded=False):
+                    st.json(payload)
+
+        _render_detailed_card(detail_cols[0], 'OpenAI 상세', selected_openai)
+        _render_detailed_card(detail_cols[1], 'Gemini 상세', selected_gemini)
+
+        # 입력 컨텍스트 표시
+        st.markdown('#### 입력 데이터')
+        with st.expander('입력 컨텍스트 JSON', expanded=False):
+            context_payload = selected_item.get('context') or {}
+            if isinstance(context_payload, str):
+                context_payload = _parse_json_field(context_payload)
+            st.json(context_payload)
 
 
 def _format_confidence(value: Any) -> str:
@@ -1556,10 +1689,18 @@ def _prepare_ai_chart_df(entry: Dict[str, Any]) -> pd.DataFrame | None:
     if 'time' not in df.columns:
         return None
     try:
-        df['time'] = pd.to_datetime(df['time'])
+        df['time'] = pd.to_datetime(df['time'], utc=True)
+        try:
+            df['time'] = df['time'].dt.tz_convert('Asia/Seoul')
+        except Exception:
+            df['time'] = df['time'].dt.tz_localize('Asia/Seoul', ambiguous='NaT', nonexistent='shift_forward')
     except Exception:
         try:
-            df['time'] = pd.to_datetime(df['time'].astype(str))
+            df['time'] = pd.to_datetime(df['time'].astype(str), utc=True)
+            try:
+                df['time'] = df['time'].dt.tz_convert('Asia/Seoul')
+            except Exception:
+                df['time'] = df['time'].dt.tz_localize('Asia/Seoul', ambiguous='NaT', nonexistent='shift_forward')
         except Exception:
             return None
     for col in ['open', 'high', 'low', 'close', 'volume']:

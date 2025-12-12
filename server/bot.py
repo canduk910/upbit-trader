@@ -53,6 +53,8 @@ class TradingBot:
         self._last_ai_result = None
         self._last_sell_timestamp = 0.0
         self._last_size_plan = None
+        self._entry_price = 0.0  # 매수 진입가 저장
+        self._entry_volume = 0.0  # 매수 수량 저장
 
         # AI 거절 쿨다운 관련 변수
         self._ai_reject_cooldown_end_ts = 0.0
@@ -320,6 +322,11 @@ class TradingBot:
             if balance <= 0 and locked <= 0:
                 continue
 
+            # 매우 작은 잔고(1e-07 미만)는 무시 (거래 불가능한 종목일 가능성)
+            if balance + locked < 1e-07:
+                log.debug(f'Skipping very small balance for {currency}: {balance + locked}')
+                continue
+
             market_symbol = f'KRW-{currency}'
             # 현재 심볼의 현재가는 df 기준 마지막 종가 사용
             if market_symbol == symbol:
@@ -580,8 +587,9 @@ class TradingBot:
                         else:
                             event_reason = 'AI 거절'
                             log.info(f"❌ AI Ensemble REJECTED the BUY signal (AI said: {ai_decision}). Holding.")
-                            # 10개 캔들 쿨다운 설정
-                            self._set_ai_reject_cooldown(10)
+                            # 설정된 캔들 수만큼 쿨다운 (기본값 3)
+                            cooldown_candles = int(getattr(config, 'AI_REJECT_COOLDOWN_CANDLES', 3))
+                            self._set_ai_reject_cooldown(cooldown_candles)
 
                 # 매도 신호 처리
                 elif technical_signal == 'SELL' and self.in_position:
@@ -631,8 +639,9 @@ class TradingBot:
                         else:
                             event_reason = 'AI 거절'
                             log.info(f"❌ AI Ensemble REJECTED the SELL signal (AI said: {ai_decision}). Holding.")
-                            # 10개 캔들 쿨다운 설정
-                            self._set_ai_reject_cooldown(10)
+                            # 설정된 캔들 수만큼 쿨다운 (기본값 3)
+                            cooldown_candles = int(getattr(config, 'AI_REJECT_COOLDOWN_CANDLES', 3))
+                            self._set_ai_reject_cooldown(cooldown_candles)
 
                 # 4. 매매 실행
                 self._log_event_check(technical_signal, ai_payload, final_decision, event_reason, config_info)
@@ -680,12 +689,38 @@ class TradingBot:
             payload.take_profit_price = plan.get('take_profit_price')
             payload.market_factor = plan.get('market_factor')
             payload.risk_amount = plan.get('risk_amount')
+
+            # 매수 성공 시 콜백으로 진입가 저장
+            def on_buy_complete(success: bool, result: dict):
+                if success:
+                    response = result.get('response', {})
+                    if isinstance(response, dict):
+                        # 평균 체결가를 진입가로 저장
+                        avg_price = float(response.get('avg_price', 0) or response.get('price', 0) or 0)
+                        executed_volume = float(response.get('executed_volume', 0) or response.get('volume', 0) or 0)
+                        if avg_price > 0:
+                            self._entry_price = avg_price
+                            self._entry_volume = executed_volume
+                            log.info(f"진입가 저장: {avg_price:.0f} KRW, 수량: {executed_volume:.8f}")
+
+            payload.callback = on_buy_complete
         else:
+            # 매도 시 진입가와 매도 비율 전달
             payload.action = 'SELL'
-            payload.volume = self.api.get_balance(self.market.split('-')[1])
+            payload.entry_price = self._entry_price  # 저장된 진입가 사용
+            payload.volume = 0.0  # 0으로 설정하면 order_executor에서 비율 계산
             payload.amount_krw = 0.0
+
+            # 매도 비율 설정 (기본 30%, config에서 변경 가능)
+            sell_ratio = float(getattr(config, 'SELL_RATIO', 0.3))
+            payload.metadata['sell_ratio'] = sell_ratio
+            payload.metadata['entry_price'] = self._entry_price
+
             self._last_sell_timestamp = time.time()
-            self._last_size_plan = None
+
+            # 전량 매도가 아니므로 포지션은 유지
+            # 일부 매도 후에도 잔고가 남아있으면 in_position은 True 유지
+
         self.order_executor.submit(payload)
 
     def _log_event_check(self, technical_signal, ai_payload, final_decision, reason, config_info):

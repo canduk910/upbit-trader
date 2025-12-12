@@ -4,6 +4,7 @@ import hashlib
 from urllib.parse import urlencode
 import requests
 import time
+import random
 from typing import Optional
 from server.logger import log
 try:
@@ -120,7 +121,11 @@ class UpbitAPI:
                             extra = f" - {txt.text}"
                     except Exception:
                         extra = ''
-                    log.error(f"HTTP error occurred: {http_err}{extra}")
+                    # 404 에러는 경고 레벨로만 기록 (거래 중단된 종목일 수 있음)
+                    if status == 404:
+                        log.warning(f"HTTP 404 (Not Found) occurred: {http_err}{extra}")
+                    else:
+                        log.error(f"HTTP error occurred: {http_err}{extra}")
                     break
                 # else loop will retry
             except requests.exceptions.RequestException as req_e:

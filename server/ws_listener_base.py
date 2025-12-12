@@ -453,19 +453,34 @@ class BaseWebsocketListener(abc.ABC):
             self.logger.warning(f"Redis write failed for websocket payload: {exc}")
 
     def _record_exec_history(self, payload: Dict[str, Any]) -> None:
-        if payload.get("type") != "order":
+        # myOrder와 order 타입 모두 처리
+        payload_type = payload.get("type")
+        if payload_type not in ("order", "myOrder"):
             return
+
+        # 체결 완료된 주문만 기록 (state가 done이거나 체결량이 있는 경우)
+        state = payload.get("state") or ""
+        if state not in ("done", "완료") and not payload.get("trade_volume"):
+            return
+
         ts = payload.get("timestamp") or payload.get("trade_timestamp") or int(time.time() * 1000)
+        symbol = payload.get("code") or payload.get("symbol") or payload.get("market")
+        price = payload.get("price") or payload.get("order_price") or payload.get("trade_price") or 0
+        size = payload.get("trade_volume") or payload.get("volume") or payload.get("executed_volume") or 0
+        side = payload.get("side") or payload.get("order_side") or payload.get("ask_bid") or ""
+
         entry = {
             "ts": float(ts) / 1000.0 if isinstance(ts, (int, float)) else float(time.time()),
-            "symbol": payload.get("code") or payload.get("symbol"),
-            "price": payload.get("price") or payload.get("order_price") or 0,
-            "size": payload.get("trade_volume") or payload.get("volume") or 0,
-            "side": payload.get("side") or payload.get("order_side") or payload.get("ask_bid"),
+            "symbol": symbol,
+            "price": price,
+            "size": size,
+            "side": side,
             "order_id": payload.get("uuid") or payload.get("order_id"),
+            "order_type": payload.get("ord_type") or payload.get("order_type"),
+            "state": state,
         }
-        side = (entry.get("side") or "").lower()
-        symbol = entry.get("symbol")
+
+        side_lower = (side or "").lower()
         avg_price = payload.get("avg_price") or payload.get("avg_buy_price") or payload.get("order_price") or payload.get("price")
         try:
             avg_price_val = float(avg_price) if avg_price is not None else 0.0
@@ -473,11 +488,33 @@ class BaseWebsocketListener(abc.ABC):
             avg_price_val = 0.0
 
         entry_price_value = 0.0
-        if side in ("bid", "buy", "매수"):
+        profit_loss = 0.0
+        profit_loss_pct = 0.0
+
+        if side_lower in ("bid", "buy", "매수"):
+            # 매수: 진입가 저장
             self._entry_prices[symbol] = avg_price_val or self._entry_prices.get(symbol, 0.0)
+            entry["entry_price"] = 0.0  # 매수 시에는 entry_price는 0
         else:
-            entry_price_value = self._entry_prices.get(symbol, avg_price_val)
-        entry["entry_price"] = entry_price_value or 0.0
+            # 매도: 진입가 조회하여 손익 계산
+            entry_price_value = self._entry_prices.get(symbol, 0.0)
+            entry["entry_price"] = entry_price_value
+
+            if entry_price_value > 0 and avg_price_val > 0:
+                try:
+                    trade_size = float(size)
+                    profit_loss = (avg_price_val - entry_price_value) * trade_size
+                    profit_loss_pct = ((avg_price_val / entry_price_value) - 1) * 100
+                    entry["profit_loss"] = profit_loss
+                    entry["profit_loss_pct"] = profit_loss_pct
+
+                    self.logger.info(
+                        f"매도 체결 손익: {profit_loss:+.2f} KRW ({profit_loss_pct:+.2f}%) "
+                        f"[{symbol} 진입가: {entry_price_value:.0f}, 매도가: {avg_price_val:.0f}]"
+                    )
+                except Exception as exc:
+                    self.logger.warning(f"Failed to calculate P&L: {exc}")
+
         if symbol:
             self.history_store.record(entry)
 
