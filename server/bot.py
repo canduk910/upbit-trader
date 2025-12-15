@@ -193,6 +193,7 @@ class TradingBot:
             if current_mtime and self._config_mtime and current_mtime != self._config_mtime:
                 log.info("Runtime config.json changed. Reloading configuration...")
                 config.reload_config()
+                self._load_config_values()  # 설정값 다시 로드
                 self._reinit_components()
                 self._config_mtime = current_mtime
             elif current_mtime and not self._config_mtime:
@@ -520,7 +521,7 @@ class TradingBot:
                 config_info = {
                     'strategy': config.STRATEGY_NAME,
                     'market': self.market,
-                    'loop_interval': self.loop_interval,
+                    'loop_interval': self.bot_interval,  # 실제 봇 체크 인터벌 사용
                     'min_order': config.MIN_ORDER_AMOUNT,
                     'trade_amount': self.trade_amount_krw,
                     'kelly': config.USE_KELLY_CRITERION,
